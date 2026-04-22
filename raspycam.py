@@ -343,13 +343,13 @@ def main() -> int:
     parser.add_argument(
         "--fps",
         type=float,
-        default=90.0,
-        help="Target preview framerate (default: 30)",
+        default=120.0,
+        help="Target preview framerate (default: 120)",
     )
     parser.add_argument(
         "--pixel-format",
         choices=["auto", "rgb565le", "rgb565be", "bgr565le", "xrgb8888"],
-        default="auto",
+        default="bgr565le",
         help="Framebuffer pixel format (default: auto)",
     )
     parser.add_argument(
@@ -371,10 +371,10 @@ def main() -> int:
     parser.add_argument(
         "--unsynced-fps",
         type=float,
-        default=60.0,
+        default=90.0,
         help=(
             "When no framebuffer sync is available, cap preview updates to this FPS "
-            "to reduce visible tearing. Set <=0 to disable (default: 12)"
+            "to reduce visible tearing. Set <=0 to disable (default: 90)"
         ),
     )
     args = parser.parse_args()
