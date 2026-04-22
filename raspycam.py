@@ -297,6 +297,7 @@ def resize_frame_to_display(frame: np.ndarray, disp_w: int, disp_h: int) -> np.n
 
 def capture_still_photo_to_file(
     picam,
+    preview_config,
     current_wb_gains: Optional[Tuple[float, float]],
     fallback_size: Tuple[int, int],
     output_path: pathlib.Path,
@@ -317,9 +318,23 @@ def capture_still_photo_to_file(
         main={"size": max_size},
         raw=None,
         buffer_count=1,
+        queue=False,
         controls=still_controls,
     )
-    picam.switch_mode_and_capture_file(still_config, str(output_path), "main")
+
+    picam.stop()
+    try:
+        picam.configure(still_config)
+        picam.start()
+        # Focus in still mode right before capture.
+        trigger_autofocus(picam)
+        picam.capture_file(str(output_path), name="main")
+    finally:
+        picam.stop()
+        picam.configure(preview_config)
+        picam.start()
+        if current_wb_gains is not None:
+            picam.set_controls({"AwbEnable": False, "ColourGains": current_wb_gains})
 
 
 def load_photo_preview(photo_path: pathlib.Path, disp_w: int, disp_h: int) -> np.ndarray:
@@ -921,14 +936,14 @@ def main() -> int:
                 frame_begin = time.monotonic()
                 if button_monitor.poll_pressed():
                     print(f"Button press on GPIO{GPIO_BUTTON_PIN}: starting autofocus...")
-                    trigger_autofocus(picam)
                     presenter.present(black_payload)
                     print("Capturing full-resolution photo...")
                     try:
                         photo_path = next_photo_path(PHOTO_DIR)
                         capture_still_photo_to_file(
                             picam,
-                            current_wb_gains,
+                            preview_config=config,
+                            current_wb_gains=current_wb_gains,
                             fallback_size=(cam_w, cam_h),
                             output_path=photo_path,
                         )
