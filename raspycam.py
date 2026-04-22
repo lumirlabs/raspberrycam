@@ -87,27 +87,14 @@ def pick_framebuffer(preferred_fb: str) -> str:
     return "/dev/fb1"
 
 
-def fit_cover_numpy(frame: np.ndarray, width: int, height: int) -> np.ndarray:
-    src_h, src_w = frame.shape[:2]
-    src_ratio = src_w / src_h
-    dst_ratio = width / height
-    if src_ratio > dst_ratio:
-        crop_h = src_h
-        crop_w = int(crop_h * dst_ratio)
-    else:
-        crop_w = src_w
-        crop_h = int(crop_w / dst_ratio)
-
-    left = max(0, (src_w - crop_w) // 2)
-    top = max(0, (src_h - crop_h) // 2)
-    cropped = frame[top : top + crop_h, left : left + crop_w]
-
-    if cropped.shape[1] == width and cropped.shape[0] == height:
-        return cropped
-
-    pil_img = Image.fromarray(cropped, mode="RGB")
-    resized = pil_img.resize((width, height), Image.Resampling.BILINEAR)
-    return np.asarray(resized, dtype=np.uint8)
+def load_base_image(base_image_path: str, disp_w: int, disp_h: int) -> np.ndarray:
+    try:
+        img = Image.open(base_image_path).convert("RGB")
+    except Exception as exc:
+        raise ValueError(f"Failed to open base image '{base_image_path}': {exc}") from exc
+    if img.size != (disp_w, disp_h):
+        img = img.resize((disp_w, disp_h), Image.Resampling.BILINEAR)
+    return np.asarray(img, dtype=np.uint8)
 
 
 def rgb888_to_rgb565_bytes(frame: np.ndarray, *, little_endian: bool, bgr: bool) -> bytes:
@@ -179,8 +166,8 @@ def parse_size(size_text: str) -> Tuple[int, int]:
     return w, h
 
 
-def prepare_preview_frame(frame: np.ndarray, disp_w: int, disp_h: int, rotate: int) -> np.ndarray:
-    img = fit_cover_numpy(frame, disp_w, disp_h)
+def prepare_preview_frame(frame: np.ndarray, preview_w: int, preview_h: int, rotate: int) -> np.ndarray:
+    img = frame
     if rotate:
         # np.rot90 rotates counter-clockwise.
         if rotate == 90:
@@ -189,12 +176,12 @@ def prepare_preview_frame(frame: np.ndarray, disp_w: int, disp_h: int, rotate: i
             img = np.rot90(img, 2)
         elif rotate == 270:
             img = np.rot90(img, 3)
-        if img.shape[1] != disp_w or img.shape[0] != disp_h:
-            pil_img = Image.fromarray(img, mode="RGB")
-            img = np.asarray(
-                pil_img.resize((disp_w, disp_h), Image.Resampling.BILINEAR),
-                dtype=np.uint8,
-            )
+    if img.shape[1] != preview_w or img.shape[0] != preview_h:
+        pil_img = Image.fromarray(img, mode="RGB")
+        img = np.asarray(
+            pil_img.resize((preview_w, preview_h), Image.Resampling.BILINEAR),
+            dtype=np.uint8,
+        )
     return img
 
 
@@ -249,7 +236,8 @@ class FramebufferPresenter:
         self.fd = fb_file.fileno()
         self.disp_w = disp_w
         self.disp_h = disp_h
-        self.frame_bytes = disp_w * disp_h * pixel_format_bytes_per_pixel(pixel_format)
+        self.pixel_bytes = pixel_format_bytes_per_pixel(pixel_format)
+        self.frame_bytes = disp_w * disp_h * self.pixel_bytes
         self.fb_size = os.fstat(self.fd).st_size
         self.mm: Optional[mmap.mmap] = None
         if self.fb_size >= self.frame_bytes and self.fb_size > 0:
@@ -314,6 +302,42 @@ class FramebufferPresenter:
         # For single-buffer streaming, prefer one contiguous write syscall.
         os.pwrite(self.fd, payload, 0)
 
+    def present_region(self, payload: bytes, x: int, y: int, w: int, h: int) -> None:
+        if x < 0 or y < 0 or w <= 0 or h <= 0:
+            raise ValueError("Invalid region bounds")
+        if x + w > self.disp_w or y + h > self.disp_h:
+            raise ValueError("Region exceeds display bounds")
+
+        expected_len = w * h * self.pixel_bytes
+        if len(payload) != expected_len:
+            raise ValueError(
+                f"Region payload size mismatch: got {len(payload)}, expected {expected_len}"
+            )
+
+        if self.vsync_enabled:
+            wait_for_vsync(self.fd)
+
+        row_bytes = w * self.pixel_bytes
+        row_stride = self.disp_w * self.pixel_bytes
+        page_base = self.front_idx * self.frame_bytes if self.pageflip_enabled else 0
+
+        if x == 0 and w == self.disp_w:
+            offset = page_base + y * row_stride
+            os.pwrite(self.fd, payload, offset)
+            return
+
+        if self.mm is not None:
+            for row in range(h):
+                src_off = row * row_bytes
+                dst_off = page_base + ((y + row) * row_stride) + (x * self.pixel_bytes)
+                self.mm[dst_off : dst_off + row_bytes] = payload[src_off : src_off + row_bytes]
+            return
+
+        for row in range(h):
+            src_off = row * row_bytes
+            dst_off = page_base + ((y + row) * row_stride) + (x * self.pixel_bytes)
+            os.pwrite(self.fd, payload[src_off : src_off + row_bytes], dst_off)
+
     def close(self) -> None:
         if self.mm is not None:
             self.mm.close()
@@ -337,8 +361,13 @@ def main() -> int:
     )
     parser.add_argument(
         "--camera-size",
-        default="480x320",
-        help="Camera capture resolution for preview (default: 480x320)",
+        default="420x280",
+        help="Camera capture resolution for preview (default: 420x280)",
+    )
+    parser.add_argument(
+        "--base-image",
+        default="baseimage.png",
+        help="Background image drawn once before preview overlay (default: baseimage.png)",
     )
     parser.add_argument(
         "--fps",
@@ -407,9 +436,20 @@ def main() -> int:
     if pixel_format == "auto":
         pixel_format = infer_pixel_format(fb_name)
 
+    try:
+        base_image = load_base_image(args.base_image, disp_w, disp_h)
+    except ValueError as e:
+        print(str(e))
+        return 1
+
+    preview_w = min(cam_w, disp_w)
+    preview_h = min(cam_h, disp_h)
+
     print(f"Framebuffer: {fb_path}")
     print(f"Display size: {disp_w}x{disp_h}")
     print(f"Preview capture size: {cam_w}x{cam_h}")
+    print(f"Preview overlay area: {preview_w}x{preview_h} at (0,0)")
+    print(f"Base image: {args.base_image}")
     print(f"Pixel format: {pixel_format}")
     print(f"Sync mode: {args.sync_mode}")
     print(f"Unsynced FPS cap: {args.unsynced_fps}")
@@ -468,12 +508,14 @@ def main() -> int:
                     print(f"Unsynced fallback: capping update rate to {effective_fps:.1f} fps")
                 else:
                     print("Unsynced fallback: fps cap disabled")
+            base_payload = encode_framebuffer_payload(base_image, pixel_format)
+            presenter.present(base_payload)
             while True:
                 frame_begin = time.monotonic()
                 frame = picam.capture_array("main")
-                preview = prepare_preview_frame(frame, disp_w, disp_h, args.rotate)
+                preview = prepare_preview_frame(frame, preview_w, preview_h, args.rotate)
                 payload = encode_framebuffer_payload(preview, pixel_format)
-                presenter.present(payload)
+                presenter.present_region(payload, x=0, y=0, w=preview_w, h=preview_h)
 
                 frames += 1
                 now = time.monotonic()
