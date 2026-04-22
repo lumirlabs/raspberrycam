@@ -36,3 +36,34 @@ python3 scripts/hw_smoketest.py --skip-display
 # explicit framebuffer and display size
 python3 scripts/hw_smoketest.py --fb /dev/fb1 --size 480x320
 ```
+
+Default framebuffer selection is `auto` (tries `/dev/fb1`, then `/dev/fb0`).
+
+## LCD HAT driver setup (Joy-IT 3.5")
+
+Based on the vendor manual (`lcd_manual.pdf`), this panel is installed using the
+`LCD-show` driver package (not by manually guessing overlays).
+
+```bash
+sudo rm -rf LCD-show
+git clone https://github.com/goodtft/LCD-show.git
+chmod -R 755 LCD-show
+cd LCD-show
+sudo ./LCD35-show
+```
+
+The installer reboots the Pi.
+
+After reboot:
+
+```bash
+ls -l /dev/fb*
+python3 ~/raspberrycam/scripts/hw_smoketest.py
+```
+
+Optional rotation (from vendor manual):
+
+```bash
+cd LCD-show
+sudo ./rotate.sh 90
+```

@@ -15,11 +15,12 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import os
+import pathlib
 import subprocess
 import sys
 import tempfile
 import time
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 from PIL import Image, ImageDraw
 
@@ -35,6 +36,21 @@ def parse_virtual_size(fb_name: str) -> Optional[Tuple[int, int]]:
         return int(width_str), int(height_str)
     except Exception:
         return None
+
+
+def list_framebuffers() -> List[str]:
+    return sorted(str(p) for p in pathlib.Path("/dev").glob("fb*"))
+
+
+def pick_framebuffer(preferred_fb: str) -> str:
+    if preferred_fb and preferred_fb.lower() != "auto":
+        return preferred_fb
+    available = list_framebuffers()
+    if "/dev/fb1" in available:
+        return "/dev/fb1"
+    if "/dev/fb0" in available:
+        return "/dev/fb0"
+    return "/dev/fb1"
 
 
 def capture_with_picamera2(width: int, height: int) -> Image.Image:
@@ -152,7 +168,11 @@ def write_framebuffer(image: Image.Image, fb_path: str, width: int, height: int)
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Camera + LCD framebuffer smoke test")
-    parser.add_argument("--fb", default="/dev/fb1", help="Framebuffer device path (default: /dev/fb1)")
+    parser.add_argument(
+        "--fb",
+        default="auto",
+        help="Framebuffer device path (default: auto; prefers /dev/fb1 then /dev/fb0)",
+    )
     parser.add_argument(
         "--size",
         default="480x320",
@@ -176,7 +196,8 @@ def main() -> int:
         print("Invalid --size format. Use WIDTHxHEIGHT, for example 480x320.")
         return 2
 
-    fb_name = os.path.basename(args.fb)
+    fb_path = pick_framebuffer(args.fb)
+    fb_name = os.path.basename(fb_path)
     detected_size = parse_virtual_size(fb_name)
     if detected_size:
         disp_w, disp_h = detected_size
@@ -184,6 +205,7 @@ def main() -> int:
         disp_w, disp_h = fallback_w, fallback_h
 
     print(f"Display target: {disp_w}x{disp_h}")
+    print(f"Framebuffer selected: {fb_path}")
 
     camera_img, camera_status = capture_camera_image(1536, 864)
     if camera_img is not None:
@@ -202,18 +224,24 @@ def main() -> int:
         print("Skipping framebuffer write (--skip-display).")
         return 0
 
-    if not os.path.exists(args.fb):
-        print(f"Framebuffer device not found: {args.fb}")
-        print("Hint: verify LCD overlay/driver and check ls /dev/fb*")
+    if not os.path.exists(fb_path):
+        print(f"Framebuffer device not found: {fb_path}")
+        available = list_framebuffers()
+        if available:
+            print(f"Available framebuffer devices: {', '.join(available)}")
+            print("Try setting one explicitly with --fb /dev/fb0 or --fb /dev/fb1.")
+        else:
+            print("No framebuffer devices were found under /dev/fb*.")
+            print("Hint: verify LCD overlay/driver in /boot/firmware/config.txt")
         return 1
 
     try:
-        write_framebuffer(status_img, args.fb, disp_w, disp_h)
-        print(f"Wrote status image to framebuffer: {args.fb}")
+        write_framebuffer(status_img, fb_path, disp_w, disp_h)
+        print(f"Wrote status image to framebuffer: {fb_path}")
         print("If the display remains blank, try running as root (sudo).")
         return 0
     except PermissionError:
-        print(f"Permission denied writing {args.fb}. Try: sudo python3 scripts/hw_smoketest.py")
+        print(f"Permission denied writing {fb_path}. Try: sudo python3 scripts/hw_smoketest.py")
         return 1
     except Exception as e:
         print(f"Failed to write framebuffer: {e}")
