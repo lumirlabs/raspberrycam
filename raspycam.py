@@ -441,12 +441,42 @@ class TouchInputMonitor:
 @dataclass
 class GpioButtonMonitor:
     pin: int
+    backend: str
     value_fd: Optional[int]
     previous_value: Optional[int]
+    active_value: Optional[int]
     exported_here: bool
+    button: Optional[object] = None
+    pending_presses: int = 0
+    last_press_ts: float = 0.0
+    debounce_s: float = 0.10
 
     @classmethod
     def create(cls, pin: int) -> "GpioButtonMonitor":
+        # First try gpiozero (modern/reliable on Raspberry Pi OS).
+        try:
+            from gpiozero import Button  # type: ignore
+
+            monitor = cls(
+                pin=pin,
+                backend="gpiozero",
+                value_fd=None,
+                previous_value=None,
+                active_value=None,
+                exported_here=False,
+            )
+            button = Button(pin, pull_up=True, bounce_time=0.05)
+            monitor.button = button
+
+            def _on_pressed() -> None:
+                monitor.pending_presses += 1
+
+            button.when_pressed = _on_pressed
+            return monitor
+        except Exception:
+            pass
+
+        # Fallback: legacy sysfs GPIO.
         gpio_path = pathlib.Path(f"/sys/class/gpio/gpio{pin}")
         exported_here = False
         if not gpio_path.exists():
@@ -454,26 +484,35 @@ class GpioButtonMonitor:
                 pathlib.Path("/sys/class/gpio/export").write_text(f"{pin}", encoding="utf-8")
                 exported_here = True
             except Exception:
-                return cls(pin=pin, value_fd=None, previous_value=None, exported_here=False)
+                return cls(
+                    pin=pin,
+                    backend="none",
+                    value_fd=None,
+                    previous_value=None,
+                    active_value=None,
+                    exported_here=False,
+                )
 
         try:
             (gpio_path / "direction").write_text("in", encoding="utf-8")
         except Exception:
             pass
         try:
-            # Falling edge matches a typical active-low tactile button wiring.
-            (gpio_path / "edge").write_text("falling", encoding="utf-8")
+            # Track both edges and infer active level from idle state.
+            (gpio_path / "edge").write_text("both", encoding="utf-8")
         except Exception:
             pass
 
         value_fd: Optional[int] = None
         previous_value: Optional[int] = None
+        active_value: Optional[int] = None
         try:
             value_fd = os.open(str(gpio_path / "value"), os.O_RDONLY | os.O_NONBLOCK)
             os.lseek(value_fd, 0, os.SEEK_SET)
             initial = os.read(value_fd, 1)
             if initial:
                 previous_value = int(initial)
+                active_value = 0 if previous_value == 1 else 1
         except Exception:
             if value_fd is not None:
                 try:
@@ -481,9 +520,23 @@ class GpioButtonMonitor:
                 except OSError:
                     pass
             value_fd = None
-        return cls(pin=pin, value_fd=value_fd, previous_value=previous_value, exported_here=exported_here)
+        backend = "sysfs" if value_fd is not None else "none"
+        return cls(
+            pin=pin,
+            backend=backend,
+            value_fd=value_fd,
+            previous_value=previous_value,
+            active_value=active_value,
+            exported_here=exported_here,
+        )
 
     def poll_pressed(self) -> bool:
+        if self.backend == "gpiozero":
+            if self.pending_presses > 0:
+                self.pending_presses -= 1
+                return True
+            return False
+
         if self.value_fd is None:
             return False
         try:
@@ -495,11 +548,29 @@ class GpioButtonMonitor:
         except Exception:
             return False
 
-        pressed = self.previous_value == 1 and value == 0
+        now = time.monotonic()
+        previous = self.previous_value
+        if self.active_value is None and previous is not None:
+            self.active_value = 0 if previous == 1 else 1
+        pressed = (
+            previous is not None
+            and self.active_value is not None
+            and previous != value
+            and value == self.active_value
+            and (now - self.last_press_ts) >= self.debounce_s
+        )
         self.previous_value = value
+        if pressed:
+            self.last_press_ts = now
         return pressed
 
     def close(self) -> None:
+        if self.button is not None:
+            try:
+                self.button.close()
+            except Exception:
+                pass
+            self.button = None
         if self.value_fd is not None:
             try:
                 os.close(self.value_fd)
@@ -680,10 +751,16 @@ def main() -> int:
                 print(f"Touch input debug enabled on: {', '.join(touch_monitor.paths)}")
             else:
                 print("Touch input debug not enabled (no touchscreen event device found or no permission).")
-            if button_monitor.value_fd is not None:
-                print(f"GPIO button debug enabled on GPIO{GPIO_BUTTON_PIN}.")
+            if button_monitor.backend != "none":
+                print(
+                    f"GPIO button debug enabled on GPIO{GPIO_BUTTON_PIN} "
+                    f"(backend: {button_monitor.backend})."
+                )
             else:
-                print(f"GPIO button debug not enabled on GPIO{GPIO_BUTTON_PIN} (check sysfs permissions/wiring).")
+                print(
+                    f"GPIO button debug not enabled on GPIO{GPIO_BUTTON_PIN} "
+                    "(check gpiozero/sysfs permissions and wiring)."
+                )
             base_payload = encode_framebuffer_payload(base_image, pixel_format)
             presenter.present(base_payload)
             while True:
