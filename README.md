@@ -72,3 +72,27 @@ Optional rotation (from vendor manual):
 cd LCD-show
 sudo ./rotate.sh 90
 ```
+
+## Live preview app
+
+Run the first digicam preview prototype:
+
+```bash
+python3 raspycam.py
+```
+
+Useful options:
+
+```bash
+# choose specific framebuffer
+python3 raspycam.py --fb /dev/fb0
+
+# adjust speed/resolution on Pi Zero 2 W
+python3 raspycam.py --camera-size 640x480 --fps 8
+
+# if orientation is wrong
+python3 raspycam.py --rotate 90
+
+# if colors are wrong
+python3 raspycam.py --pixel-format rgb565le
+```
