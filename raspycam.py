@@ -204,7 +204,7 @@ def prepare_preview_frame(frame: np.ndarray, preview_w: int, preview_h: int, rot
     return img
 
 
-def estimate_white_balance_gains(frame: np.ndarray) -> Tuple[float, float]:
+def estimate_white_balance_stats(frame: np.ndarray) -> Tuple[float, float, float, float, float]:
     # Gray-world estimate: map red/blue averages toward green average.
     frame_f = frame.astype(np.float32)
     if frame_f.ndim != 3 or frame_f.shape[2] < 3:
@@ -231,6 +231,11 @@ def estimate_white_balance_gains(frame: np.ndarray) -> Tuple[float, float]:
     # Picamera2 docs indicate ColourGains values in [0, 32].
     r_gain = min(max(r_gain, 0.1), 8.0)
     b_gain = min(max(b_gain, 0.1), 8.0)
+    return r_gain, b_gain, r_mean, g_mean, b_mean
+
+
+def estimate_white_balance_gains(frame: np.ndarray) -> Tuple[float, float]:
+    r_gain, b_gain, _, _, _ = estimate_white_balance_stats(frame)
     return r_gain, b_gain
 
 
@@ -1095,7 +1100,9 @@ def main() -> int:
                                 wb_reference_path.unlink()
                             except Exception:
                                 pass
-                        r_gain, b_gain = estimate_white_balance_gains(wb_reference_frame)
+                        r_gain, b_gain, r_mean, g_mean, b_mean = estimate_white_balance_stats(
+                            wb_reference_frame
+                        )
                         if (r_gain <= 0.11 and b_gain <= 0.11) or (r_gain >= 7.9 and b_gain >= 7.9):
                             raise ValueError(
                                 "WB estimate saturated at clamp limits; ignoring unstable reference frame."
@@ -1114,6 +1121,7 @@ def main() -> int:
                         print(
                             "White balance reset from touch: "
                             f"{touch_coords} "
+                            f"RGB means=({r_mean:.2f}, {g_mean:.2f}, {b_mean:.2f}) "
                             f"ColourGains=({r_gain:.3f}, {b_gain:.3f}) "
                             f"(saved to {WB_PROFILE_PATH.name})"
                         )
