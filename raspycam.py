@@ -13,9 +13,11 @@ from __future__ import annotations
 import argparse
 from array import array
 import fcntl
+import json
 import mmap
 import os
 import pathlib
+import re
 import select
 import struct
 import sys
@@ -24,7 +26,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 
 FBIOGET_VSCREENINFO = 0x4600
 FBIOPAN_DISPLAY = 0x4606
@@ -39,6 +41,9 @@ ABS_MT_POSITION_X = 0x35
 ABS_MT_POSITION_Y = 0x36
 GPIO_BUTTON_PIN = 16
 INPUT_EVENT_STRUCT = struct.Struct("llHHI")
+WB_PROFILE_PATH = pathlib.Path(__file__).with_name("white_balance_gains.json")
+PHOTO_DIR = pathlib.Path("/DCIM")
+PHOTO_PREFIX = "lmr_"
 
 
 def parse_virtual_size(fb_name: str) -> Optional[Tuple[int, int]]:
@@ -193,6 +198,122 @@ def prepare_preview_frame(frame: np.ndarray, preview_w: int, preview_h: int, rot
             dtype=np.uint8,
         )
     return img
+
+
+def estimate_white_balance_gains(frame: np.ndarray) -> Tuple[float, float]:
+    # Gray-world estimate: map red/blue averages toward green average.
+    frame_f = frame.astype(np.float32)
+    r_mean = float(frame_f[:, :, 0].mean())
+    g_mean = float(frame_f[:, :, 1].mean())
+    b_mean = float(frame_f[:, :, 2].mean())
+    eps = 1e-6
+    r_gain = g_mean / max(r_mean, eps)
+    b_gain = g_mean / max(b_mean, eps)
+    # Picamera2 docs indicate ColourGains values in [0, 32].
+    r_gain = min(max(r_gain, 0.1), 8.0)
+    b_gain = min(max(b_gain, 0.1), 8.0)
+    return r_gain, b_gain
+
+
+def draw_status_message(frame: np.ndarray, text: str) -> np.ndarray:
+    image = Image.fromarray(frame, mode="RGB")
+    draw = ImageDraw.Draw(image)
+    text_bbox = draw.textbbox((0, 0), text)
+    text_w = text_bbox[2] - text_bbox[0]
+    text_h = text_bbox[3] - text_bbox[1]
+    pad_x = 10
+    pad_y = 6
+    box_w = text_w + 2 * pad_x
+    box_h = text_h + 2 * pad_y
+    box_x = max((image.width - box_w) // 2, 0)
+    box_y = max(image.height - box_h - 10, 0)
+    draw.rectangle(
+        (box_x, box_y, min(box_x + box_w, image.width), min(box_y + box_h, image.height)),
+        fill=(0, 0, 0),
+    )
+    draw.text((box_x + pad_x, box_y + pad_y), text, fill=(255, 255, 255))
+    return np.asarray(image, dtype=np.uint8)
+
+
+def load_white_balance_profile(path: pathlib.Path) -> Optional[Tuple[float, float]]:
+    if not path.exists():
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        r_gain = float(raw.get("r_gain"))
+        b_gain = float(raw.get("b_gain"))
+        # Keep within the practical range we apply elsewhere.
+        r_gain = min(max(r_gain, 0.1), 8.0)
+        b_gain = min(max(b_gain, 0.1), 8.0)
+        return r_gain, b_gain
+    except Exception:
+        return None
+
+
+def save_white_balance_profile(path: pathlib.Path, r_gain: float, b_gain: float) -> None:
+    payload = {
+        "r_gain": float(r_gain),
+        "b_gain": float(b_gain),
+        "saved_at_unix": time.time(),
+    }
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def next_photo_path(photo_dir: pathlib.Path) -> pathlib.Path:
+    photo_dir.mkdir(parents=True, exist_ok=True)
+    max_index = 0
+    pattern = re.compile(rf"^{re.escape(PHOTO_PREFIX)}(\d+)\.png$")
+    for path in photo_dir.glob(f"{PHOTO_PREFIX}*.png"):
+        match = pattern.match(path.name)
+        if not match:
+            continue
+        max_index = max(max_index, int(match.group(1)))
+    return photo_dir / f"{PHOTO_PREFIX}{max_index + 1:04d}.png"
+
+
+def trigger_autofocus(picam) -> None:
+    try:
+        import libcamera  # type: ignore
+
+        picam.set_controls(
+            {
+                "AfMode": libcamera.controls.AfModeEnum.Auto,
+                "AfTrigger": libcamera.controls.AfTriggerEnum.Start,
+            }
+        )
+        # Give AF a short window to settle before capture.
+        time.sleep(0.6)
+    except Exception:
+        # Best effort only; not all modules/drivers expose AF controls.
+        pass
+
+
+def resize_frame_to_display(frame: np.ndarray, disp_w: int, disp_h: int) -> np.ndarray:
+    if frame.shape[1] == disp_w and frame.shape[0] == disp_h:
+        return frame
+    pil_img = Image.fromarray(frame, mode="RGB")
+    return np.asarray(pil_img.resize((disp_w, disp_h), Image.Resampling.BILINEAR), dtype=np.uint8)
+
+
+def capture_still_photo(
+    picam,
+    current_wb_gains: Optional[Tuple[float, float]],
+    fallback_size: Tuple[int, int],
+) -> np.ndarray:
+    max_size = picam.camera_properties.get("PixelArraySize") if hasattr(picam, "camera_properties") else None
+    if (
+        not isinstance(max_size, tuple)
+        or len(max_size) != 2
+        or int(max_size[0]) <= 0
+        or int(max_size[1]) <= 0
+    ):
+        max_size = fallback_size
+    still_controls = {}
+    if current_wb_gains is not None:
+        still_controls["AwbEnable"] = False
+        still_controls["ColourGains"] = current_wb_gains
+    still_config = picam.create_still_configuration(main={"size": max_size, "format": "RGB888"}, controls=still_controls)
+    return picam.switch_mode_and_capture_array(still_config, "main")
 
 
 def read_u32(buf: bytearray, offset: int) -> int:
@@ -725,6 +846,9 @@ def main() -> int:
     presenter: Optional[FramebufferPresenter] = None
     touch_monitor = TouchInputMonitor.create()
     button_monitor = GpioButtonMonitor.create(GPIO_BUTTON_PIN)
+    wb_message_until = 0.0
+    startup_wb_gains = load_white_balance_profile(WB_PROFILE_PATH)
+    current_wb_gains: Optional[Tuple[float, float]] = None
 
     try:
         with open(fb_path, "r+b", buffering=0) as fb:
@@ -761,16 +885,64 @@ def main() -> int:
                     f"GPIO button debug not enabled on GPIO{GPIO_BUTTON_PIN} "
                     "(check gpiozero/sysfs permissions and wiring)."
                 )
+            if startup_wb_gains is not None:
+                r_gain, b_gain = startup_wb_gains
+                try:
+                    picam.set_controls({"AwbEnable": False, "ColourGains": (r_gain, b_gain)})
+                    current_wb_gains = (r_gain, b_gain)
+                    print(
+                        "Loaded white balance profile from disk: "
+                        f"ColourGains=({r_gain:.3f}, {b_gain:.3f})"
+                    )
+                except Exception as e:
+                    print(f"Failed to apply saved white balance profile: {e}")
+            else:
+                print("No saved white balance profile found; using current camera AWB behavior.")
             base_payload = encode_framebuffer_payload(base_image, pixel_format)
+            black_payload = encode_framebuffer_payload(
+                np.zeros((disp_h, disp_w, 3), dtype=np.uint8),
+                pixel_format,
+            )
             presenter.present(base_payload)
             while True:
                 frame_begin = time.monotonic()
-                if touch_monitor.poll_touched():
-                    print("DEBUG input: LCD touch detected")
                 if button_monitor.poll_pressed():
-                    print(f"DEBUG input: GPIO{GPIO_BUTTON_PIN} button press detected")
+                    print(f"Button press on GPIO{GPIO_BUTTON_PIN}: starting autofocus...")
+                    trigger_autofocus(picam)
+                    presenter.present(black_payload)
+                    print("Capturing full-resolution photo...")
+                    try:
+                        still_frame = capture_still_photo(picam, current_wb_gains, fallback_size=(cam_w, cam_h))
+                        photo_path = next_photo_path(PHOTO_DIR)
+                        Image.fromarray(still_frame, mode="RGB").save(photo_path, format="PNG")
+                        print(f"Saved photo: {photo_path}")
+                        full_preview = resize_frame_to_display(still_frame, disp_w=disp_w, disp_h=disp_h)
+                        presenter.present(encode_framebuffer_payload(full_preview, pixel_format))
+                        time.sleep(2.0)
+                    except Exception as capture_err:
+                        print(f"Photo capture failed: {capture_err}")
+                    continue
                 frame = picam.capture_array("main")
+                if touch_monitor.poll_touched():
+                    r_gain, b_gain = estimate_white_balance_gains(frame)
+                    try:
+                        picam.set_controls({"AwbEnable": False, "ColourGains": (r_gain, b_gain)})
+                        current_wb_gains = (r_gain, b_gain)
+                        try:
+                            save_white_balance_profile(WB_PROFILE_PATH, r_gain, b_gain)
+                        except Exception as save_err:
+                            print(f"Failed to save white balance profile: {save_err}")
+                        wb_message_until = time.monotonic() + 1.0
+                        print(
+                            "White balance reset from touch: "
+                            f"ColourGains=({r_gain:.3f}, {b_gain:.3f}) "
+                            f"(saved to {WB_PROFILE_PATH.name})"
+                        )
+                    except Exception as e:
+                        print(f"Failed to reset white balance from touch: {e}")
                 preview = prepare_preview_frame(frame, preview_w, preview_h, args.rotate)
+                if time.monotonic() < wb_message_until:
+                    preview = draw_status_message(preview, "White Balance Reset")
                 payload = encode_framebuffer_payload(preview, pixel_format)
                 presenter.present_region(payload, x=0, y=0, w=preview_w, h=preview_h)
 
