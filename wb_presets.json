@@ -1,0 +1,21 @@
+[
+  {
+    "name": "Auto",
+    "mode": "auto"
+  },
+  {
+    "name": "Off",
+    "mode": "gains",
+    "gains": [1.0, 1.0]
+  },
+  {
+    "name": "Outdoors",
+    "mode": "gains",
+    "gains": [1.05, 1.5]
+  },
+  {
+    "name": "Indoors",
+    "mode": "gains",
+    "gains": [0.9, 2.5]
+  }
+]

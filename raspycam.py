@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 from array import array
 import fcntl
+import json
 import mmap
 import os
 import pathlib
@@ -45,6 +46,7 @@ GPIO_BUTTON_PIN = 16
 INPUT_EVENT_STRUCT = struct.Struct("llHHI")
 PHOTO_DIR = pathlib.Path(__file__).resolve().parent / "DCIM"
 PHOTO_PREFIX = "lmr_"
+WB_PRESETS_PATH = pathlib.Path(__file__).with_name("wb_presets.json")
 
 
 def parse_virtual_size(fb_name: str) -> Optional[Tuple[int, int]]:
@@ -229,6 +231,71 @@ def draw_status_message(frame: np.ndarray, text: str) -> np.ndarray:
     )
     draw.text((box_x + pad_x, box_y + pad_y), text, fill=(255, 255, 255))
     return np.asarray(image, dtype=np.uint8)
+
+
+def default_wb_presets() -> List[Tuple[str, Optional[Tuple[float, float]]]]:
+    return [
+        ("Auto", None),
+        ("Off", (1.0, 1.0)),
+        ("Outdoors", (1.05, 1.5)),
+        ("Indoors", (0.9, 2.5)),
+    ]
+
+
+def load_wb_presets(path: pathlib.Path) -> List[Tuple[str, Optional[Tuple[float, float]]]]:
+    defaults = default_wb_presets()
+    if not path.exists():
+        return defaults
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, list):
+            raise ValueError("Preset file must be a list")
+        presets: List[Tuple[str, Optional[Tuple[float, float]]]] = []
+        for item in raw:
+            if not isinstance(item, dict):
+                raise ValueError("Each preset must be an object")
+            name = str(item.get("name", "")).strip()
+            mode = str(item.get("mode", "")).strip().lower()
+            if not name:
+                raise ValueError("Preset missing non-empty name")
+            if mode == "auto":
+                presets.append((name, None))
+                continue
+            if mode == "gains":
+                gains = item.get("gains")
+                if (
+                    not isinstance(gains, list)
+                    or len(gains) != 2
+                ):
+                    raise ValueError(f"Preset '{name}' has invalid gains")
+                r_gain = float(gains[0])
+                b_gain = float(gains[1])
+                presets.append((name, (r_gain, b_gain)))
+                continue
+            raise ValueError(f"Preset '{name}' has unsupported mode '{mode}'")
+        if not presets:
+            raise ValueError("No presets found")
+        return presets
+    except Exception as exc:
+        print(f"Failed to load WB presets from {path.name}: {exc}")
+        print("Using built-in WB presets.")
+        return defaults
+
+
+def apply_wb_preset(picam, preset: Tuple[str, Optional[Tuple[float, float]]]) -> None:
+    _, gains = preset
+    if gains is None:
+        picam.set_controls({"AwbEnable": True})
+    else:
+        picam.set_controls({"AwbEnable": False, "ColourGains": gains})
+
+
+def wb_preset_status_text(preset: Tuple[str, Optional[Tuple[float, float]]]) -> str:
+    name, gains = preset
+    if gains is None:
+        return f"WB: {name} (Auto)"
+    r_gain, b_gain = gains
+    return f"WB: {name} ({r_gain:.2f},{b_gain:.2f})"
 
 
 def next_photo_path(photo_dir: pathlib.Path) -> pathlib.Path:
@@ -877,9 +944,10 @@ def main() -> int:
     presenter: Optional[FramebufferPresenter] = None
     touch_monitor = TouchInputMonitor.create()
     button_monitor = GpioButtonMonitor.create(GPIO_BUTTON_PIN)
+    wb_presets = load_wb_presets(WB_PRESETS_PATH)
+    wb_preset_idx = 0
     wb_status_until = 0.0
     wb_status_text = ""
-    wb_manual_mode = False
 
     try:
         with open(fb_path, "r+b", buffering=0) as fb:
@@ -917,8 +985,12 @@ def main() -> int:
                     "(check gpiozero/sysfs permissions and wiring)."
                 )
             try:
-                picam.set_controls({"AwbEnable": True})
-                print("White balance mode: auto")
+                apply_wb_preset(picam, wb_presets[wb_preset_idx])
+                print(
+                    "White balance presets loaded: "
+                    + ", ".join(name for name, _ in wb_presets)
+                )
+                print(f"White balance mode: {wb_preset_status_text(wb_presets[wb_preset_idx])}")
             except Exception as e:
                 print(f"Failed to set initial white balance mode: {e}")
             base_payload = encode_framebuffer_payload(base_image, pixel_format)
@@ -939,7 +1011,7 @@ def main() -> int:
                         picam.stop()
                         picam.close()
                         time.sleep(0.15)
-                        photo_wb_gains = (1.0, 1.0) if wb_manual_mode else None
+                        photo_wb_gains = wb_presets[wb_preset_idx][1]
                         capture_still_photo_to_file(
                             max_size=max_still_size,
                             manual_awb_gains=photo_wb_gains,
@@ -954,23 +1026,17 @@ def main() -> int:
                     finally:
                         # Recreate preview camera after external capture command.
                         picam = create_preview_camera(Picamera2, cam_w, cam_h, frame_duration_us)
-                        if wb_manual_mode:
-                            picam.set_controls({"AwbEnable": False, "ColourGains": (1.0, 1.0)})
-                        else:
-                            picam.set_controls({"AwbEnable": True})
+                        apply_wb_preset(picam, wb_presets[wb_preset_idx])
                     continue
                 frame = picam.capture_array("main")
                 touch_pos = touch_monitor.poll_touched()
                 if touch_pos is not None:
                     try:
                         touch_x, touch_y = touch_pos
-                        wb_manual_mode = not wb_manual_mode
-                        if wb_manual_mode:
-                            picam.set_controls({"AwbEnable": False, "ColourGains": (1.0, 1.0)})
-                            wb_status_text = "WB: Manual 1.0,1.0"
-                        else:
-                            picam.set_controls({"AwbEnable": True})
-                            wb_status_text = "WB: Auto"
+                        wb_preset_idx = (wb_preset_idx + 1) % len(wb_presets)
+                        active_wb_preset = wb_presets[wb_preset_idx]
+                        apply_wb_preset(picam, active_wb_preset)
+                        wb_status_text = wb_preset_status_text(active_wb_preset)
                         wb_status_until = time.monotonic() + 1.0
                         touch_coords = (
                             f"touch=({touch_x}, {touch_y})"
