@@ -70,3 +70,5 @@ joaoperfig@epaperclock:~ $ hostnamectl
 Operating System: Debian GNU/Linux 13 (trixie)
           Kernel: Linux 6.12.47+rpt-rpi-v8
     Architecture: arm64
+joaoperfig@epaperclock:~/raspberrycam $ python --version
+Python 3.13.5
