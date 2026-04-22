@@ -175,14 +175,14 @@ def main() -> int:
     )
     parser.add_argument(
         "--camera-size",
-        default="640x480",
-        help="Camera capture resolution for preview (default: 640x480)",
+        default="480x320",
+        help="Camera capture resolution for preview (default: 480x320)",
     )
     parser.add_argument(
         "--fps",
         type=float,
-        default=10.0,
-        help="Target preview framerate (default: 10)",
+        default=30.0,
+        help="Target preview framerate (default: 30)",
     )
     parser.add_argument(
         "--pixel-format",
@@ -241,7 +241,14 @@ def main() -> int:
         return 1
 
     picam = Picamera2()
-    config = picam.create_preview_configuration(main={"size": (cam_w, cam_h), "format": "RGB888"})
+    target_fps = max(args.fps, 1.0)
+    frame_duration_us = int(1_000_000 / target_fps)
+    config = picam.create_video_configuration(
+        main={"size": (cam_w, cam_h), "format": "RGB888"},
+        controls={"FrameDurationLimits": (frame_duration_us, frame_duration_us)},
+        buffer_count=4,
+        queue=True,
+    )
     picam.configure(config)
 
     try:
