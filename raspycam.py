@@ -297,58 +297,53 @@ def resize_frame_to_display(frame: np.ndarray, disp_w: int, disp_h: int) -> np.n
     return np.asarray(pil_img.resize((disp_w, disp_h), Image.Resampling.BILINEAR), dtype=np.uint8)
 
 
-def capture_still_photo_to_file(
-    picam,
-    preview_config,
-    current_wb_gains: Optional[Tuple[float, float]],
-    fallback_size: Tuple[int, int],
-    output_path: pathlib.Path,
-) -> None:
+def pick_max_still_size(picam, fallback_size: Tuple[int, int]) -> Tuple[int, int]:
     max_size = picam.camera_properties.get("PixelArraySize") if hasattr(picam, "camera_properties") else None
     if (
-        not isinstance(max_size, tuple)
-        or len(max_size) != 2
-        or int(max_size[0]) <= 0
-        or int(max_size[1]) <= 0
+        isinstance(max_size, tuple)
+        and len(max_size) == 2
+        and int(max_size[0]) > 0
+        and int(max_size[1]) > 0
     ):
-        max_size = fallback_size
+        return int(max_size[0]), int(max_size[1])
+    return fallback_size
+
+
+def capture_still_photo_to_file(
+    max_size: Tuple[int, int],
+    current_wb_gains: Optional[Tuple[float, float]],
+    output_path: pathlib.Path,
+) -> None:
     still_cli = shutil.which("rpicam-still") or shutil.which("libcamera-still")
-    picam.stop()
+    if still_cli is None:
+        raise RuntimeError("Neither rpicam-still nor libcamera-still is installed.")
+
+    cmd = [
+        still_cli,
+        "-n",
+        "--width",
+        str(max_size[0]),
+        "--height",
+        str(max_size[1]),
+        "--autofocus-mode",
+        "auto",
+        "--autofocus-on-capture",
+        "--timeout",
+        "1200",
+        "-o",
+        str(output_path),
+    ]
+    if current_wb_gains is not None:
+        r_gain, b_gain = current_wb_gains
+        cmd.extend(["--awbgains", f"{r_gain:.6f},{b_gain:.6f}"])
+
     try:
-        if still_cli is None:
-            raise RuntimeError("Neither rpicam-still nor libcamera-still is installed.")
-
-        cmd = [
-            still_cli,
-            "-n",
-            "--width",
-            str(max_size[0]),
-            "--height",
-            str(max_size[1]),
-            "--autofocus-mode",
-            "auto",
-            "--autofocus-on-capture",
-            "--timeout",
-            "1200",
-            "-o",
-            str(output_path),
-        ]
-        if current_wb_gains is not None:
-            r_gain, b_gain = current_wb_gains
-            cmd.extend(["--awbgains", f"{r_gain:.6f},{b_gain:.6f}"])
-
-        try:
-            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        except subprocess.CalledProcessError as exc:
-            output = (exc.stdout or "").strip()
-            if output:
-                raise RuntimeError(output.splitlines()[-1]) from exc
-            raise RuntimeError(str(exc)) from exc
-    finally:
-        picam.configure(preview_config)
-        picam.start()
-        if current_wb_gains is not None:
-            picam.set_controls({"AwbEnable": False, "ColourGains": current_wb_gains})
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    except subprocess.CalledProcessError as exc:
+        output = (exc.stdout or "").strip()
+        if output:
+            raise RuntimeError(output.splitlines()[-1]) from exc
+        raise RuntimeError(str(exc)) from exc
 
 
 def load_photo_preview(photo_path: pathlib.Path, disp_w: int, disp_h: int) -> np.ndarray:
@@ -872,6 +867,7 @@ def main() -> int:
         queue=True,
     )
     picam.configure(config)
+    max_still_size = pick_max_still_size(picam, fallback_size=(cam_w, cam_h))
 
     try:
         picam.start()
@@ -954,11 +950,13 @@ def main() -> int:
                     print("Capturing full-resolution photo...")
                     try:
                         photo_path = next_photo_path(PHOTO_DIR)
+                        # Release camera fully so CLI still capture can acquire it.
+                        picam.stop()
+                        picam.close()
+                        time.sleep(0.15)
                         capture_still_photo_to_file(
-                            picam,
-                            preview_config=config,
+                            max_size=max_still_size,
                             current_wb_gains=current_wb_gains,
-                            fallback_size=(cam_w, cam_h),
                             output_path=photo_path,
                         )
                         print(f"Saved photo: {photo_path}")
@@ -967,6 +965,19 @@ def main() -> int:
                         time.sleep(2.0)
                     except Exception as capture_err:
                         print(f"Photo capture failed: {capture_err}")
+                    finally:
+                        # Recreate preview camera after external capture command.
+                        picam = Picamera2()
+                        config = picam.create_video_configuration(
+                            main={"size": (cam_w, cam_h), "format": "RGB888"},
+                            controls={"FrameDurationLimits": (frame_duration_us, frame_duration_us)},
+                            buffer_count=4,
+                            queue=True,
+                        )
+                        picam.configure(config)
+                        picam.start()
+                        if current_wb_gains is not None:
+                            picam.set_controls({"AwbEnable": False, "ColourGains": current_wb_gains})
                     continue
                 frame = picam.capture_array("main")
                 if touch_monitor.poll_touched():
@@ -1021,8 +1032,14 @@ def main() -> int:
             pass
         touch_monitor.close()
         button_monitor.close()
-        picam.stop()
-        picam.close()
+        try:
+            picam.stop()
+        except Exception:
+            pass
+        try:
+            picam.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
