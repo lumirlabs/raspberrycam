@@ -41,6 +41,7 @@ BTN_TOUCH = 0x014A
 ABS_PRESSURE = 0x18
 ABS_MT_POSITION_X = 0x35
 ABS_MT_POSITION_Y = 0x36
+ABS_MT_TRACKING_ID = 0x39
 GPIO_BUTTON_PIN = 16
 INPUT_EVENT_STRUCT = struct.Struct("llHHI")
 WB_PROFILE_PATH = pathlib.Path(__file__).with_name("white_balance_gains.json")
@@ -205,9 +206,24 @@ def prepare_preview_frame(frame: np.ndarray, preview_w: int, preview_h: int, rot
 def estimate_white_balance_gains(frame: np.ndarray) -> Tuple[float, float]:
     # Gray-world estimate: map red/blue averages toward green average.
     frame_f = frame.astype(np.float32)
-    r_mean = float(frame_f[:, :, 0].mean())
-    g_mean = float(frame_f[:, :, 1].mean())
-    b_mean = float(frame_f[:, :, 2].mean())
+    if frame_f.ndim != 3 or frame_f.shape[2] < 3:
+        raise ValueError(f"Unexpected frame shape for WB estimation: {frame.shape}")
+    h, w = frame_f.shape[:2]
+    x0 = int(w * 0.2)
+    x1 = int(w * 0.8)
+    y0 = int(h * 0.2)
+    y1 = int(h * 0.8)
+    sample = frame_f[y0:y1, x0:x1, :3]
+    luma = sample.mean(axis=2)
+    valid_mask = (luma > 8.0) & (luma < 247.0)
+    if int(valid_mask.sum()) < 1024:
+        # Fall back to the crop when dynamic masking removes too many pixels.
+        valid = sample.reshape(-1, 3)
+    else:
+        valid = sample[valid_mask]
+    r_mean = float(valid[:, 0].mean())
+    g_mean = float(valid[:, 1].mean())
+    b_mean = float(valid[:, 2].mean())
     eps = 1e-6
     r_gain = g_mean / max(r_mean, eps)
     b_gain = g_mean / max(b_mean, eps)
@@ -217,12 +233,13 @@ def estimate_white_balance_gains(frame: np.ndarray) -> Tuple[float, float]:
     return r_gain, b_gain
 
 
-def capture_wb_reference_frame(picam, settle_frames: int = 2) -> np.ndarray:
+def capture_wb_reference_frame(picam, settle_frames: int = 12) -> np.ndarray:
     """
     Capture a fresh frame with neutral colour gains for WB estimation.
     """
     picam.set_controls({"AwbEnable": False, "ColourGains": (1.0, 1.0)})
-    # Drop a couple of frames so the control change is reflected in the sensor output.
+    # The preview stream is queued; discard enough frames to flush stale buffers.
+    time.sleep(0.10)
     frame = picam.capture_array("main")
     for _ in range(max(settle_frames, 0)):
         frame = picam.capture_array("main")
@@ -556,6 +573,7 @@ class TouchInputMonitor:
     debounce_s: float = 0.2
     last_touch_x: Optional[int] = None
     last_touch_y: Optional[int] = None
+    touch_active: bool = False
 
     @classmethod
     def create(cls) -> "TouchInputMonitor":
@@ -588,22 +606,28 @@ class TouchInputMonitor:
                 if len(chunk) < INPUT_EVENT_STRUCT.size:
                     break
                 _, _, event_type, event_code, event_value = INPUT_EVENT_STRUCT.unpack(chunk)
-                if event_type == EV_KEY and event_code == BTN_TOUCH and event_value == 1:
-                    touched = True
+                if event_type == EV_KEY and event_code == BTN_TOUCH:
+                    is_down = event_value != 0
+                    if is_down and not self.touch_active:
+                        touched = True
+                    self.touch_active = is_down
                 elif event_type == EV_ABS and event_code == ABS_MT_POSITION_X:
                     self.last_touch_x = int(event_value)
-                    if event_value > 0:
-                        touched = True
                 elif event_type == EV_ABS and event_code == ABS_MT_POSITION_Y:
                     self.last_touch_y = int(event_value)
-                    if event_value > 0:
+                elif event_type == EV_ABS and event_code == ABS_MT_TRACKING_ID:
+                    is_down = event_value != 0xFFFFFFFF
+                    if is_down and not self.touch_active:
                         touched = True
+                    self.touch_active = is_down
                 elif (
                     event_type == EV_ABS
                     and event_code == ABS_PRESSURE
-                    and event_value > 0
                 ):
-                    touched = True
+                    is_down = event_value > 0
+                    if is_down and not self.touch_active:
+                        touched = True
+                    self.touch_active = is_down
         if touched and (now - self.last_touch_ts) >= self.debounce_s:
             self.last_touch_ts = now
             return self.last_touch_x, self.last_touch_y
@@ -1008,6 +1032,10 @@ def main() -> int:
                         touch_x, touch_y = touch_pos
                         wb_reference_frame = capture_wb_reference_frame(picam)
                         r_gain, b_gain = estimate_white_balance_gains(wb_reference_frame)
+                        if (r_gain <= 0.11 and b_gain <= 0.11) or (r_gain >= 7.9 and b_gain >= 7.9):
+                            raise ValueError(
+                                "WB estimate saturated at clamp limits; ignoring unstable reference frame."
+                            )
                         picam.set_controls({"AwbEnable": False, "ColourGains": (r_gain, b_gain)})
                         current_wb_gains = (r_gain, b_gain)
                         frame = picam.capture_array("main")
