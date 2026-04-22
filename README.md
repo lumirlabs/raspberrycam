@@ -101,4 +101,7 @@ python3 raspycam.py --pixel-format rgb565le
 python3 raspycam.py --sync-mode auto
 python3 raspycam.py --sync-mode vsync
 python3 raspycam.py --sync-mode pageflip
+
+# on drivers without vsync/pageflip, cap update rate
+python3 raspycam.py --sync-mode auto --unsynced-fps 10
 ```

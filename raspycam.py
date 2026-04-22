@@ -285,22 +285,21 @@ class FramebufferPresenter:
             else:
                 # Fallback to a normal write if panning unexpectedly fails.
                 self.pageflip_enabled = False
-                if self.mm is not None:
-                    self.mm[0 : self.frame_bytes] = payload
-                else:
-                    os.pwrite(self.fd, payload, 0)
+                os.pwrite(self.fd, payload, 0)
             return
 
         if self.vsync_enabled:
             wait_for_vsync(self.fd)
-        if self.mm is not None:
-            self.mm[0 : self.frame_bytes] = payload
-        else:
-            os.pwrite(self.fd, payload, 0)
+        # For single-buffer streaming, prefer one contiguous write syscall.
+        os.pwrite(self.fd, payload, 0)
 
     def close(self) -> None:
         if self.mm is not None:
             self.mm.close()
+
+    @property
+    def has_sync(self) -> bool:
+        return self.pageflip_enabled or self.vsync_enabled
 
 
 def main() -> int:
@@ -348,6 +347,15 @@ def main() -> int:
             "then vsync, then unsynced writes (default: auto)"
         ),
     )
+    parser.add_argument(
+        "--unsynced-fps",
+        type=float,
+        default=12.0,
+        help=(
+            "When no framebuffer sync is available, cap preview updates to this FPS "
+            "to reduce visible tearing. Set <=0 to disable (default: 12)"
+        ),
+    )
     args = parser.parse_args()
 
     try:
@@ -383,6 +391,7 @@ def main() -> int:
     print(f"Preview capture size: {cam_w}x{cam_h}")
     print(f"Pixel format: {pixel_format}")
     print(f"Sync mode: {args.sync_mode}")
+    print(f"Unsynced FPS cap: {args.unsynced_fps}")
     print("Starting live preview. Press Ctrl+C to stop.")
 
     try:
@@ -432,6 +441,12 @@ def main() -> int:
                 print("Framebuffer sync: vsync enabled")
             else:
                 print("Framebuffer sync: unsynced writes")
+                if args.unsynced_fps > 0:
+                    effective_fps = min(args.fps, args.unsynced_fps)
+                    interval = 1.0 / max(effective_fps, 0.1)
+                    print(f"Unsynced fallback: capping update rate to {effective_fps:.1f} fps")
+                else:
+                    print("Unsynced fallback: fps cap disabled")
             while True:
                 frame_begin = time.monotonic()
                 frame = picam.capture_array("main")
