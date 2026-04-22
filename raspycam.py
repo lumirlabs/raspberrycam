@@ -47,6 +47,8 @@ INPUT_EVENT_STRUCT = struct.Struct("llHHI")
 WB_PROFILE_PATH = pathlib.Path(__file__).with_name("white_balance_gains.json")
 PHOTO_DIR = pathlib.Path(__file__).resolve().parent / "DCIM"
 PHOTO_PREFIX = "lmr_"
+# Picamera2 "RGB888" arrays can still arrive in BGR byte order on some stacks.
+WB_REFERENCE_FRAME_IS_BGR = True
 
 
 def parse_virtual_size(fb_name: str) -> Optional[Tuple[int, int]]:
@@ -221,9 +223,14 @@ def estimate_white_balance_stats(frame: np.ndarray) -> Tuple[float, float, float
         valid = sample.reshape(-1, 3)
     else:
         valid = sample[valid_mask]
-    r_mean = float(valid[:, 0].mean())
-    g_mean = float(valid[:, 1].mean())
-    b_mean = float(valid[:, 2].mean())
+    if WB_REFERENCE_FRAME_IS_BGR:
+        b_mean = float(valid[:, 0].mean())
+        g_mean = float(valid[:, 1].mean())
+        r_mean = float(valid[:, 2].mean())
+    else:
+        r_mean = float(valid[:, 0].mean())
+        g_mean = float(valid[:, 1].mean())
+        b_mean = float(valid[:, 2].mean())
     eps = 1e-6
     r_gain = g_mean / max(r_mean, eps)
     b_gain = g_mean / max(b_mean, eps)
