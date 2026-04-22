@@ -89,6 +89,7 @@ python3 raspycam.py --fb /dev/fb0
 
 # adjust speed/resolution on Pi Zero 2 W
 python3 raspycam.py --camera-size 640x480 --fps 8
+python3 raspycam.py --camera-size 480x320 --fps 15
 
 # if orientation is wrong
 python3 raspycam.py --rotate 90

@@ -17,6 +17,7 @@ import sys
 import time
 from typing import List, Optional, Tuple
 
+import numpy as np
 from PIL import Image
 
 
@@ -62,63 +63,65 @@ def pick_framebuffer(preferred_fb: str) -> str:
     return "/dev/fb1"
 
 
-def fit_cover(image: Image.Image, width: int, height: int) -> Image.Image:
-    src_w, src_h = image.size
+def fit_cover_numpy(frame: np.ndarray, width: int, height: int) -> np.ndarray:
+    src_h, src_w = frame.shape[:2]
     src_ratio = src_w / src_h
     dst_ratio = width / height
     if src_ratio > dst_ratio:
-        new_h = src_h
-        new_w = int(new_h * dst_ratio)
+        crop_h = src_h
+        crop_w = int(crop_h * dst_ratio)
     else:
-        new_w = src_w
-        new_h = int(new_w / dst_ratio)
-    left = (src_w - new_w) // 2
-    top = (src_h - new_h) // 2
-    cropped = image.crop((left, top, left + new_w, top + new_h))
-    return cropped.resize((width, height), Image.Resampling.BILINEAR)
+        crop_w = src_w
+        crop_h = int(crop_w / dst_ratio)
+
+    left = max(0, (src_w - crop_w) // 2)
+    top = max(0, (src_h - crop_h) // 2)
+    cropped = frame[top : top + crop_h, left : left + crop_w]
+
+    if cropped.shape[1] == width and cropped.shape[0] == height:
+        return cropped
+
+    pil_img = Image.fromarray(cropped, mode="RGB")
+    resized = pil_img.resize((width, height), Image.Resampling.BILINEAR)
+    return np.asarray(resized, dtype=np.uint8)
 
 
-def rgb888_to_rgb565_bytes(image: Image.Image, *, little_endian: bool, bgr: bool) -> bytes:
-    image = image.convert("RGB")
-    out = bytearray(image.width * image.height * 2)
-    i = 0
-    for r, g, b in image.getdata():
-        if bgr:
-            r, b = b, r
-        rgb565 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
-        if little_endian:
-            out[i] = rgb565 & 0xFF
-            out[i + 1] = (rgb565 >> 8) & 0xFF
-        else:
-            out[i] = (rgb565 >> 8) & 0xFF
-            out[i + 1] = rgb565 & 0xFF
-        i += 2
-    return bytes(out)
+def rgb888_to_rgb565_bytes(frame: np.ndarray, *, little_endian: bool, bgr: bool) -> bytes:
+    rgb = frame
+    if bgr:
+        r = rgb[:, :, 2].astype(np.uint16)
+        g = rgb[:, :, 1].astype(np.uint16)
+        b = rgb[:, :, 0].astype(np.uint16)
+    else:
+        r = rgb[:, :, 0].astype(np.uint16)
+        g = rgb[:, :, 1].astype(np.uint16)
+        b = rgb[:, :, 2].astype(np.uint16)
+
+    rgb565 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
+    if little_endian:
+        return rgb565.astype("<u2", copy=False).tobytes()
+    return rgb565.astype(">u2", copy=False).tobytes()
 
 
-def rgb888_to_xrgb8888_bytes(image: Image.Image) -> bytes:
-    image = image.convert("RGB")
-    out = bytearray(image.width * image.height * 4)
-    i = 0
-    for r, g, b in image.getdata():
-        # Little-endian XRGB8888 byte order in memory: B, G, R, X
-        out[i] = b
-        out[i + 1] = g
-        out[i + 2] = r
-        out[i + 3] = 0x00
-        i += 4
-    return bytes(out)
+def rgb888_to_xrgb8888_bytes(frame: np.ndarray) -> bytes:
+    h, w = frame.shape[:2]
+    out = np.empty((h, w, 4), dtype=np.uint8)
+    out[:, :, 0] = frame[:, :, 2]  # B
+    out[:, :, 1] = frame[:, :, 1]  # G
+    out[:, :, 2] = frame[:, :, 0]  # R
+    out[:, :, 3] = 0x00            # X
+    return out.tobytes()
 
 
-def encode_framebuffer_payload(image: Image.Image, pixel_format: str) -> bytes:
+def encode_framebuffer_payload(frame: np.ndarray, pixel_format: str) -> bytes:
     if pixel_format == "rgb565le":
-        return rgb888_to_rgb565_bytes(image, little_endian=True, bgr=False)
+        return rgb888_to_rgb565_bytes(frame, little_endian=True, bgr=False)
     if pixel_format == "rgb565be":
-        return rgb888_to_rgb565_bytes(image, little_endian=False, bgr=False)
+        return rgb888_to_rgb565_bytes(frame, little_endian=False, bgr=False)
     if pixel_format == "bgr565le":
-        return rgb888_to_rgb565_bytes(image, little_endian=True, bgr=True)
+        return rgb888_to_rgb565_bytes(frame, little_endian=True, bgr=True)
     if pixel_format == "xrgb8888":
-        return rgb888_to_xrgb8888_bytes(image)
+        return rgb888_to_xrgb8888_bytes(frame)
     raise ValueError(f"Unsupported pixel format: {pixel_format}")
 
 
@@ -139,13 +142,22 @@ def parse_size(size_text: str) -> Tuple[int, int]:
     return w, h
 
 
-def prepare_preview_frame(
-    frame_image: Image.Image, disp_w: int, disp_h: int, rotate: int
-) -> Image.Image:
-    img = fit_cover(frame_image, disp_w, disp_h)
+def prepare_preview_frame(frame: np.ndarray, disp_w: int, disp_h: int, rotate: int) -> np.ndarray:
+    img = fit_cover_numpy(frame, disp_w, disp_h)
     if rotate:
-        rotated = img.rotate(rotate, expand=True)
-        img = rotated.resize((disp_w, disp_h), Image.Resampling.BILINEAR)
+        # np.rot90 rotates counter-clockwise.
+        if rotate == 90:
+            img = np.rot90(img, 1)
+        elif rotate == 180:
+            img = np.rot90(img, 2)
+        elif rotate == 270:
+            img = np.rot90(img, 3)
+        if img.shape[1] != disp_w or img.shape[0] != disp_h:
+            pil_img = Image.fromarray(img, mode="RGB")
+            img = np.asarray(
+                pil_img.resize((disp_w, disp_h), Image.Resampling.BILINEAR),
+                dtype=np.uint8,
+            )
     return img
 
 
@@ -163,8 +175,8 @@ def main() -> int:
     )
     parser.add_argument(
         "--camera-size",
-        default="960x540",
-        help="Camera capture resolution for preview (default: 960x540)",
+        default="640x480",
+        help="Camera capture resolution for preview (default: 640x480)",
     )
     parser.add_argument(
         "--fps",
@@ -250,8 +262,7 @@ def main() -> int:
             while True:
                 frame_begin = time.monotonic()
                 frame = picam.capture_array("main")
-                image = Image.fromarray(frame).convert("RGB")
-                preview = prepare_preview_frame(image, disp_w, disp_h, args.rotate)
+                preview = prepare_preview_frame(frame, disp_w, disp_h, args.rotate)
                 payload = encode_framebuffer_payload(preview, pixel_format)
                 fb.seek(0)
                 fb.write(payload)
