@@ -295,11 +295,12 @@ def resize_frame_to_display(frame: np.ndarray, disp_w: int, disp_h: int) -> np.n
     return np.asarray(pil_img.resize((disp_w, disp_h), Image.Resampling.BILINEAR), dtype=np.uint8)
 
 
-def capture_still_photo(
+def capture_still_photo_to_file(
     picam,
     current_wb_gains: Optional[Tuple[float, float]],
     fallback_size: Tuple[int, int],
-) -> np.ndarray:
+    output_path: pathlib.Path,
+) -> None:
     max_size = picam.camera_properties.get("PixelArraySize") if hasattr(picam, "camera_properties") else None
     if (
         not isinstance(max_size, tuple)
@@ -312,8 +313,20 @@ def capture_still_photo(
     if current_wb_gains is not None:
         still_controls["AwbEnable"] = False
         still_controls["ColourGains"] = current_wb_gains
-    still_config = picam.create_still_configuration(main={"size": max_size, "format": "RGB888"}, controls=still_controls)
-    return picam.switch_mode_and_capture_array(still_config, "main")
+    still_config = picam.create_still_configuration(
+        main={"size": max_size},
+        raw=None,
+        buffer_count=1,
+        controls=still_controls,
+    )
+    picam.switch_mode_and_capture_file(still_config, str(output_path), "main")
+
+
+def load_photo_preview(photo_path: pathlib.Path, disp_w: int, disp_h: int) -> np.ndarray:
+    with Image.open(photo_path) as captured:
+        rgb = captured.convert("RGB")
+        resized = rgb.resize((disp_w, disp_h), Image.Resampling.BILINEAR)
+    return np.asarray(resized, dtype=np.uint8)
 
 
 def read_u32(buf: bytearray, offset: int) -> int:
@@ -912,11 +925,15 @@ def main() -> int:
                     presenter.present(black_payload)
                     print("Capturing full-resolution photo...")
                     try:
-                        still_frame = capture_still_photo(picam, current_wb_gains, fallback_size=(cam_w, cam_h))
                         photo_path = next_photo_path(PHOTO_DIR)
-                        Image.fromarray(still_frame, mode="RGB").save(photo_path, format="PNG")
+                        capture_still_photo_to_file(
+                            picam,
+                            current_wb_gains,
+                            fallback_size=(cam_w, cam_h),
+                            output_path=photo_path,
+                        )
                         print(f"Saved photo: {photo_path}")
-                        full_preview = resize_frame_to_display(still_frame, disp_w=disp_w, disp_h=disp_h)
+                        full_preview = load_photo_preview(photo_path, disp_w=disp_w, disp_h=disp_h)
                         presenter.present(encode_framebuffer_payload(full_preview, pixel_format))
                         time.sleep(2.0)
                     except Exception as capture_err:
