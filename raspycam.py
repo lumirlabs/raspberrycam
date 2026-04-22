@@ -13,7 +13,6 @@ from __future__ import annotations
 import argparse
 from array import array
 import fcntl
-import json
 import mmap
 import os
 import pathlib
@@ -44,16 +43,8 @@ ABS_MT_POSITION_Y = 0x36
 ABS_MT_TRACKING_ID = 0x39
 GPIO_BUTTON_PIN = 16
 INPUT_EVENT_STRUCT = struct.Struct("llHHI")
-WB_PROFILE_PATH = pathlib.Path(__file__).with_name("white_balance_gains.json")
 PHOTO_DIR = pathlib.Path(__file__).resolve().parent / "DCIM"
 PHOTO_PREFIX = "lmr_"
-# Picamera2 "RGB888" arrays can still arrive in BGR byte order on some stacks.
-WB_REFERENCE_FRAME_IS_BGR = True
-# WB stabilizers to avoid extreme color casts from noisy reference frames.
-WB_GAIN_BLEND = 0.55
-WB_MIN_CHANNEL_MEAN = 32.0
-WB_MIN_GAIN = 0.3
-WB_MAX_GAIN = 3.0
 
 
 def parse_virtual_size(fb_name: str) -> Optional[Tuple[int, int]]:
@@ -210,61 +201,6 @@ def prepare_preview_frame(frame: np.ndarray, preview_w: int, preview_h: int, rot
     return img
 
 
-def estimate_white_balance_stats(frame: np.ndarray) -> Tuple[float, float, float, float, float]:
-    # Gray-world estimate: map red/blue averages toward green average.
-    frame_f = frame.astype(np.float32)
-    if frame_f.ndim != 3 or frame_f.shape[2] < 3:
-        raise ValueError(f"Unexpected frame shape for WB estimation: {frame.shape}")
-    h, w = frame_f.shape[:2]
-    x0 = int(w * 0.2)
-    x1 = int(w * 0.8)
-    y0 = int(h * 0.2)
-    y1 = int(h * 0.8)
-    sample = frame_f[y0:y1, x0:x1, :3]
-    luma = sample.mean(axis=2)
-    valid_mask = (luma > 8.0) & (luma < 247.0)
-    if int(valid_mask.sum()) < 1024:
-        # Fall back to the crop when dynamic masking removes too many pixels.
-        valid = sample.reshape(-1, 3)
-    else:
-        valid = sample[valid_mask]
-    if WB_REFERENCE_FRAME_IS_BGR:
-        r_values = valid[:, 2]
-        g_values = valid[:, 1]
-        b_values = valid[:, 0]
-    else:
-        r_values = valid[:, 0]
-        g_values = valid[:, 1]
-        b_values = valid[:, 2]
-
-    def robust_mean(channel_values: np.ndarray) -> float:
-        # Trim outliers so specular highlights/shadows do not dominate WB.
-        lo = float(np.percentile(channel_values, 5.0))
-        hi = float(np.percentile(channel_values, 95.0))
-        trimmed = channel_values[(channel_values >= lo) & (channel_values <= hi)]
-        if trimmed.size == 0:
-            return float(channel_values.mean())
-        return float(trimmed.mean())
-
-    r_mean = robust_mean(r_values)
-    g_mean = robust_mean(g_values)
-    b_mean = robust_mean(b_values)
-    eps = 1e-6
-    r_gain_raw = g_mean / max(r_mean, WB_MIN_CHANNEL_MEAN, eps)
-    b_gain_raw = g_mean / max(b_mean, WB_MIN_CHANNEL_MEAN, eps)
-    r_gain = 1.0 + ((r_gain_raw - 1.0) * WB_GAIN_BLEND)
-    b_gain = 1.0 + ((b_gain_raw - 1.0) * WB_GAIN_BLEND)
-    # Picamera2 docs indicate ColourGains values in [0, 32].
-    r_gain = min(max(r_gain, WB_MIN_GAIN), WB_MAX_GAIN)
-    b_gain = min(max(b_gain, WB_MIN_GAIN), WB_MAX_GAIN)
-    return r_gain, b_gain, r_mean, g_mean, b_mean
-
-
-def estimate_white_balance_gains(frame: np.ndarray) -> Tuple[float, float]:
-    r_gain, b_gain, _, _, _ = estimate_white_balance_stats(frame)
-    return r_gain, b_gain
-
-
 def run_still_capture_command(cmd: List[str]) -> None:
     try:
         subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -293,30 +229,6 @@ def draw_status_message(frame: np.ndarray, text: str) -> np.ndarray:
     )
     draw.text((box_x + pad_x, box_y + pad_y), text, fill=(255, 255, 255))
     return np.asarray(image, dtype=np.uint8)
-
-
-def load_white_balance_profile(path: pathlib.Path) -> Optional[Tuple[float, float]]:
-    if not path.exists():
-        return None
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-        r_gain = float(raw.get("r_gain"))
-        b_gain = float(raw.get("b_gain"))
-        # Keep within the practical range we apply elsewhere.
-        r_gain = min(max(r_gain, 0.1), 8.0)
-        b_gain = min(max(b_gain, 0.1), 8.0)
-        return r_gain, b_gain
-    except Exception:
-        return None
-
-
-def save_white_balance_profile(path: pathlib.Path, r_gain: float, b_gain: float) -> None:
-    payload = {
-        "r_gain": float(r_gain),
-        "b_gain": float(b_gain),
-        "saved_at_unix": time.time(),
-    }
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 def next_photo_path(photo_dir: pathlib.Path) -> pathlib.Path:
@@ -369,7 +281,7 @@ def pick_max_still_size(picam, fallback_size: Tuple[int, int]) -> Tuple[int, int
 
 def capture_still_photo_to_file(
     max_size: Tuple[int, int],
-    current_wb_gains: Optional[Tuple[float, float]],
+    manual_awb_gains: Optional[Tuple[float, float]],
     output_path: pathlib.Path,
 ) -> None:
     still_cli = shutil.which("rpicam-still") or shutil.which("libcamera-still")
@@ -391,41 +303,10 @@ def capture_still_photo_to_file(
         "-o",
         str(output_path),
     ]
-    if current_wb_gains is not None:
-        r_gain, b_gain = current_wb_gains
+    if manual_awb_gains is not None:
+        r_gain, b_gain = manual_awb_gains
         cmd.extend(["--awbgains", f"{r_gain:.6f},{b_gain:.6f}"])
     run_still_capture_command(cmd)
-
-
-def capture_wb_reference_frame(
-    Picamera2,
-    reference_size: Tuple[int, int],
-    settle_frames: int = 12,
-) -> np.ndarray:
-    wb_cam = Picamera2()
-    try:
-        config = wb_cam.create_video_configuration(
-            main={"size": reference_size, "format": "RGB888"},
-            buffer_count=4,
-            queue=True,
-        )
-        wb_cam.configure(config)
-        wb_cam.start()
-        wb_cam.set_controls({"AwbEnable": False, "ColourGains": (1.0, 1.0)})
-        time.sleep(0.10)
-        frame = wb_cam.capture_array("main")
-        for _ in range(max(settle_frames, 0)):
-            frame = wb_cam.capture_array("main")
-        return frame
-    finally:
-        try:
-            wb_cam.stop()
-        except Exception:
-            pass
-        try:
-            wb_cam.close()
-        except Exception:
-            pass
 
 
 def create_preview_camera(Picamera2, cam_w: int, cam_h: int, frame_duration_us: int):
@@ -980,7 +861,6 @@ def main() -> int:
     )
     picam.configure(config)
     max_still_size = pick_max_still_size(picam, fallback_size=(cam_w, cam_h))
-    wb_reference_size = (min(640, max_still_size[0]), min(480, max_still_size[1]))
 
     try:
         picam.start()
@@ -997,9 +877,9 @@ def main() -> int:
     presenter: Optional[FramebufferPresenter] = None
     touch_monitor = TouchInputMonitor.create()
     button_monitor = GpioButtonMonitor.create(GPIO_BUTTON_PIN)
-    wb_message_until = 0.0
-    startup_wb_gains = load_white_balance_profile(WB_PROFILE_PATH)
-    current_wb_gains: Optional[Tuple[float, float]] = None
+    wb_status_until = 0.0
+    wb_status_text = ""
+    wb_manual_mode = False
 
     try:
         with open(fb_path, "r+b", buffering=0) as fb:
@@ -1036,19 +916,11 @@ def main() -> int:
                     f"GPIO button debug not enabled on GPIO{GPIO_BUTTON_PIN} "
                     "(check gpiozero/sysfs permissions and wiring)."
                 )
-            if startup_wb_gains is not None:
-                r_gain, b_gain = startup_wb_gains
-                try:
-                    picam.set_controls({"AwbEnable": False, "ColourGains": (r_gain, b_gain)})
-                    current_wb_gains = (r_gain, b_gain)
-                    print(
-                        "Loaded white balance profile from disk: "
-                        f"ColourGains=({r_gain:.3f}, {b_gain:.3f})"
-                    )
-                except Exception as e:
-                    print(f"Failed to apply saved white balance profile: {e}")
-            else:
-                print("No saved white balance profile found; using current camera AWB behavior.")
+            try:
+                picam.set_controls({"AwbEnable": True})
+                print("White balance mode: auto")
+            except Exception as e:
+                print(f"Failed to set initial white balance mode: {e}")
             base_payload = encode_framebuffer_payload(base_image, pixel_format)
             black_payload = encode_framebuffer_payload(
                 np.zeros((disp_h, disp_w, 3), dtype=np.uint8),
@@ -1067,9 +939,10 @@ def main() -> int:
                         picam.stop()
                         picam.close()
                         time.sleep(0.15)
+                        photo_wb_gains = (1.0, 1.0) if wb_manual_mode else None
                         capture_still_photo_to_file(
                             max_size=max_still_size,
-                            current_wb_gains=current_wb_gains,
+                            manual_awb_gains=photo_wb_gains,
                             output_path=photo_path,
                         )
                         print(f"Saved photo: {photo_path}")
@@ -1081,58 +954,36 @@ def main() -> int:
                     finally:
                         # Recreate preview camera after external capture command.
                         picam = create_preview_camera(Picamera2, cam_w, cam_h, frame_duration_us)
-                        if current_wb_gains is not None:
-                            picam.set_controls({"AwbEnable": False, "ColourGains": current_wb_gains})
+                        if wb_manual_mode:
+                            picam.set_controls({"AwbEnable": False, "ColourGains": (1.0, 1.0)})
+                        else:
+                            picam.set_controls({"AwbEnable": True})
                     continue
                 frame = picam.capture_array("main")
                 touch_pos = touch_monitor.poll_touched()
                 if touch_pos is not None:
                     try:
                         touch_x, touch_y = touch_pos
-                        presenter.present(black_payload)
-                        # Fully release preview stream/device before WB reference still capture.
-                        picam.stop()
-                        picam.close()
-                        time.sleep(0.15)
-                        wb_reference_frame = capture_wb_reference_frame(
-                            Picamera2=Picamera2,
-                            reference_size=wb_reference_size,
-                        )
-                        r_gain, b_gain, r_mean, g_mean, b_mean = estimate_white_balance_stats(
-                            wb_reference_frame
-                        )
-                        if (r_gain <= 0.11 and b_gain <= 0.11) or (r_gain >= 7.9 and b_gain >= 7.9):
-                            raise ValueError(
-                                "WB estimate saturated at clamp limits; ignoring unstable reference frame."
-                            )
-                        current_wb_gains = (r_gain, b_gain)
-                        try:
-                            save_white_balance_profile(WB_PROFILE_PATH, r_gain, b_gain)
-                        except Exception as save_err:
-                            print(f"Failed to save white balance profile: {save_err}")
-                        wb_message_until = time.monotonic() + 1.0
+                        wb_manual_mode = not wb_manual_mode
+                        if wb_manual_mode:
+                            picam.set_controls({"AwbEnable": False, "ColourGains": (1.0, 1.0)})
+                            wb_status_text = "WB: Manual 1.0,1.0"
+                        else:
+                            picam.set_controls({"AwbEnable": True})
+                            wb_status_text = "WB: Auto"
+                        wb_status_until = time.monotonic() + 1.0
                         touch_coords = (
                             f"touch=({touch_x}, {touch_y})"
                             if touch_x is not None and touch_y is not None
                             else "touch=(unknown)"
                         )
-                        print(
-                            "White balance reset from touch: "
-                            f"{touch_coords} "
-                            f"RGB means=({r_mean:.2f}, {g_mean:.2f}, {b_mean:.2f}) "
-                            f"ColourGains=({r_gain:.3f}, {b_gain:.3f}) "
-                            f"(saved to {WB_PROFILE_PATH.name})"
-                        )
+                        print(f"White balance toggled from touch: {touch_coords} -> {wb_status_text}")
                     except Exception as e:
-                        print(f"Failed to reset white balance from touch: {e}")
-                    finally:
-                        picam = create_preview_camera(Picamera2, cam_w, cam_h, frame_duration_us)
-                        if current_wb_gains is not None:
-                            picam.set_controls({"AwbEnable": False, "ColourGains": current_wb_gains})
+                        print(f"Failed to toggle white balance from touch: {e}")
                     continue
                 preview = prepare_preview_frame(frame, preview_w, preview_h, args.rotate)
-                if time.monotonic() < wb_message_until:
-                    preview = draw_status_message(preview, "White Balance Reset")
+                if time.monotonic() < wb_status_until:
+                    preview = draw_status_message(preview, wb_status_text)
                 payload = encode_framebuffer_payload(preview, pixel_format)
                 presenter.present_region(payload, x=0, y=0, w=preview_w, h=preview_h)
 
