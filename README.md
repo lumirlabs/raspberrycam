@@ -96,4 +96,9 @@ python3 raspycam.py --rotate 90
 
 # if colors are wrong
 python3 raspycam.py --pixel-format rgb565le
+
+# reduce tearing/scanlines (auto uses vsync/pageflip when supported)
+python3 raspycam.py --sync-mode auto
+python3 raspycam.py --sync-mode vsync
+python3 raspycam.py --sync-mode pageflip
 ```

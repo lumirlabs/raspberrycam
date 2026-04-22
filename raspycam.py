@@ -11,14 +11,24 @@ Current feature set:
 from __future__ import annotations
 
 import argparse
+from array import array
+import fcntl
+import mmap
 import os
 import pathlib
+import struct
 import sys
 import time
 from typing import List, Optional, Tuple
 
 import numpy as np
 from PIL import Image
+
+FBIOGET_VSCREENINFO = 0x4600
+FBIOPAN_DISPLAY = 0x4606
+FBIO_WAITFORVSYNC = 0x4680
+FB_VAR_SCREENINFO_SIZE = 160
+FB_YOFFSET_OFFSET = 20
 
 
 def parse_virtual_size(fb_name: str) -> Optional[Tuple[int, int]]:
@@ -125,6 +135,12 @@ def encode_framebuffer_payload(frame: np.ndarray, pixel_format: str) -> bytes:
     raise ValueError(f"Unsupported pixel format: {pixel_format}")
 
 
+def pixel_format_bytes_per_pixel(pixel_format: str) -> int:
+    if pixel_format == "xrgb8888":
+        return 4
+    return 2
+
+
 def infer_pixel_format(fb_name: str) -> str:
     bpp = read_bits_per_pixel(fb_name)
     if bpp == 32:
@@ -159,6 +175,132 @@ def prepare_preview_frame(frame: np.ndarray, disp_w: int, disp_h: int, rotate: i
                 dtype=np.uint8,
             )
     return img
+
+
+def read_u32(buf: bytearray, offset: int) -> int:
+    return struct.unpack_from("=I", buf, offset)[0]
+
+
+def write_u32(buf: bytearray, offset: int, value: int) -> None:
+    struct.pack_into("=I", buf, offset, value)
+
+
+def read_var_screeninfo(fd: int) -> Optional[bytearray]:
+    info = bytearray(FB_VAR_SCREENINFO_SIZE)
+    try:
+        fcntl.ioctl(fd, FBIOGET_VSCREENINFO, info, True)
+        return info
+    except OSError:
+        return None
+
+
+def wait_for_vsync(fd: int) -> bool:
+    token = array("I", [0])
+    try:
+        fcntl.ioctl(fd, FBIO_WAITFORVSYNC, token, True)
+        return True
+    except OSError:
+        return False
+
+
+def pan_display(fd: int, yoffset: int) -> bool:
+    var = read_var_screeninfo(fd)
+    if var is None:
+        return False
+    write_u32(var, FB_YOFFSET_OFFSET, yoffset)
+    try:
+        fcntl.ioctl(fd, FBIOPAN_DISPLAY, var, True)
+        return True
+    except OSError:
+        return False
+
+
+class FramebufferPresenter:
+    def __init__(
+        self,
+        fb_file,
+        disp_w: int,
+        disp_h: int,
+        pixel_format: str,
+        sync_mode: str,
+    ) -> None:
+        self.fb_file = fb_file
+        self.fd = fb_file.fileno()
+        self.disp_w = disp_w
+        self.disp_h = disp_h
+        self.frame_bytes = disp_w * disp_h * pixel_format_bytes_per_pixel(pixel_format)
+        self.fb_size = os.fstat(self.fd).st_size
+        self.mm: Optional[mmap.mmap] = None
+        if self.fb_size >= self.frame_bytes and self.fb_size > 0:
+            try:
+                self.mm = mmap.mmap(self.fd, self.fb_size, access=mmap.ACCESS_WRITE)
+            except OSError:
+                self.mm = None
+
+        self.pageflip_enabled = False
+        self.vsync_enabled = False
+        self.front_idx = 0
+        self.back_idx = 0
+
+        if sync_mode != "none":
+            var = read_var_screeninfo(self.fd)
+            if var is not None:
+                xres_virtual = read_u32(var, 8)
+                yres_virtual = read_u32(var, 12)
+                supports_pageflip = (
+                    xres_virtual >= disp_w
+                    and yres_virtual >= disp_h * 2
+                    and self.fb_size >= self.frame_bytes * 2
+                )
+                if sync_mode in ("auto", "pageflip") and supports_pageflip:
+                    self.pageflip_enabled = True
+                    self.front_idx = 0
+                    self.back_idx = 1
+                elif sync_mode == "pageflip":
+                    print("Requested pageflip sync, but framebuffer does not expose two pages.")
+
+        if sync_mode in ("auto", "vsync", "pageflip"):
+            if wait_for_vsync(self.fd):
+                self.vsync_enabled = True
+            elif sync_mode == "vsync":
+                print("Requested vsync sync, but FBIO_WAITFORVSYNC is not supported.")
+
+    def present(self, payload: bytes) -> None:
+        if len(payload) != self.frame_bytes:
+            raise ValueError(
+                f"Payload size mismatch: got {len(payload)}, expected {self.frame_bytes}"
+            )
+
+        if self.pageflip_enabled:
+            write_offset = self.back_idx * self.frame_bytes
+            if self.mm is not None:
+                self.mm[write_offset : write_offset + self.frame_bytes] = payload
+            else:
+                os.pwrite(self.fd, payload, write_offset)
+            if self.vsync_enabled:
+                wait_for_vsync(self.fd)
+            if pan_display(self.fd, self.back_idx * self.disp_h):
+                self.front_idx = self.back_idx
+                self.back_idx = 1 - self.front_idx
+            else:
+                # Fallback to a normal write if panning unexpectedly fails.
+                self.pageflip_enabled = False
+                if self.mm is not None:
+                    self.mm[0 : self.frame_bytes] = payload
+                else:
+                    os.pwrite(self.fd, payload, 0)
+            return
+
+        if self.vsync_enabled:
+            wait_for_vsync(self.fd)
+        if self.mm is not None:
+            self.mm[0 : self.frame_bytes] = payload
+        else:
+            os.pwrite(self.fd, payload, 0)
+
+    def close(self) -> None:
+        if self.mm is not None:
+            self.mm.close()
 
 
 def main() -> int:
@@ -197,6 +339,15 @@ def main() -> int:
         default=0,
         help="Rotate preview output (default: 0)",
     )
+    parser.add_argument(
+        "--sync-mode",
+        choices=["auto", "none", "vsync", "pageflip"],
+        default="auto",
+        help=(
+            "Framebuffer sync strategy: auto prefers pageflip+vsync, "
+            "then vsync, then unsynced writes (default: auto)"
+        ),
+    )
     args = parser.parse_args()
 
     try:
@@ -231,6 +382,7 @@ def main() -> int:
     print(f"Display size: {disp_w}x{disp_h}")
     print(f"Preview capture size: {cam_w}x{cam_h}")
     print(f"Pixel format: {pixel_format}")
+    print(f"Sync mode: {args.sync_mode}")
     print("Starting live preview. Press Ctrl+C to stop.")
 
     try:
@@ -263,16 +415,29 @@ def main() -> int:
     frames = 0
     started = time.monotonic()
     last_stats = started
+    presenter: Optional[FramebufferPresenter] = None
 
     try:
-        with open(fb_path, "wb", buffering=0) as fb:
+        with open(fb_path, "r+b", buffering=0) as fb:
+            presenter = FramebufferPresenter(
+                fb_file=fb,
+                disp_w=disp_w,
+                disp_h=disp_h,
+                pixel_format=pixel_format,
+                sync_mode=args.sync_mode,
+            )
+            if presenter.pageflip_enabled:
+                print("Framebuffer sync: pageflip enabled")
+            elif presenter.vsync_enabled:
+                print("Framebuffer sync: vsync enabled")
+            else:
+                print("Framebuffer sync: unsynced writes")
             while True:
                 frame_begin = time.monotonic()
                 frame = picam.capture_array("main")
                 preview = prepare_preview_frame(frame, disp_w, disp_h, args.rotate)
                 payload = encode_framebuffer_payload(preview, pixel_format)
-                fb.seek(0)
-                fb.write(payload)
+                presenter.present(payload)
 
                 frames += 1
                 now = time.monotonic()
@@ -297,6 +462,10 @@ def main() -> int:
         print(f"Preview loop failed: {e}")
         return 1
     finally:
+        try:
+            presenter.close()
+        except Exception:
+            pass
         picam.stop()
         picam.close()
 
