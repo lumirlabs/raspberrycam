@@ -23,6 +23,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
@@ -233,17 +234,14 @@ def estimate_white_balance_gains(frame: np.ndarray) -> Tuple[float, float]:
     return r_gain, b_gain
 
 
-def capture_wb_reference_frame(picam, settle_frames: int = 12) -> np.ndarray:
-    """
-    Capture a fresh frame with neutral colour gains for WB estimation.
-    """
-    picam.set_controls({"AwbEnable": False, "ColourGains": (1.0, 1.0)})
-    # The preview stream is queued; discard enough frames to flush stale buffers.
-    time.sleep(0.10)
-    frame = picam.capture_array("main")
-    for _ in range(max(settle_frames, 0)):
-        frame = picam.capture_array("main")
-    return frame
+def run_still_capture_command(cmd: List[str]) -> None:
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    except subprocess.CalledProcessError as exc:
+        output = (exc.stdout or "").strip()
+        if output:
+            raise RuntimeError(output.splitlines()[-1]) from exc
+        raise RuntimeError(str(exc)) from exc
 
 
 def draw_status_message(frame: np.ndarray, text: str) -> np.ndarray:
@@ -365,14 +363,43 @@ def capture_still_photo_to_file(
     if current_wb_gains is not None:
         r_gain, b_gain = current_wb_gains
         cmd.extend(["--awbgains", f"{r_gain:.6f},{b_gain:.6f}"])
+    run_still_capture_command(cmd)
 
-    try:
-        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    except subprocess.CalledProcessError as exc:
-        output = (exc.stdout or "").strip()
-        if output:
-            raise RuntimeError(output.splitlines()[-1]) from exc
-        raise RuntimeError(str(exc)) from exc
+
+def capture_wb_reference_photo_to_file(reference_size: Tuple[int, int], output_path: pathlib.Path) -> None:
+    still_cli = shutil.which("rpicam-still") or shutil.which("libcamera-still")
+    if still_cli is None:
+        raise RuntimeError("Neither rpicam-still nor libcamera-still is installed.")
+
+    cmd = [
+        still_cli,
+        "-n",
+        "--immediate",
+        "--awb",
+        "off",
+        "--width",
+        str(reference_size[0]),
+        "--height",
+        str(reference_size[1]),
+        "--timeout",
+        "200",
+        "-o",
+        str(output_path),
+    ]
+    run_still_capture_command(cmd)
+
+
+def create_preview_camera(Picamera2, cam_w: int, cam_h: int, frame_duration_us: int):
+    picam = Picamera2()
+    config = picam.create_video_configuration(
+        main={"size": (cam_w, cam_h), "format": "RGB888"},
+        controls={"FrameDurationLimits": (frame_duration_us, frame_duration_us)},
+        buffer_count=4,
+        queue=True,
+    )
+    picam.configure(config)
+    picam.start()
+    return picam
 
 
 def load_photo_preview(photo_path: pathlib.Path, disp_w: int, disp_h: int) -> np.ndarray:
@@ -903,9 +930,9 @@ def main() -> int:
         print("Install with: sudo apt install -y python3-picamera2")
         return 1
 
-    picam = Picamera2()
     target_fps = max(args.fps, 1.0)
     frame_duration_us = int(1_000_000 / target_fps)
+    picam = Picamera2()
     config = picam.create_video_configuration(
         main={"size": (cam_w, cam_h), "format": "RGB888"},
         controls={"FrameDurationLimits": (frame_duration_us, frame_duration_us)},
@@ -914,6 +941,7 @@ def main() -> int:
     )
     picam.configure(config)
     max_still_size = pick_max_still_size(picam, fallback_size=(cam_w, cam_h))
+    wb_reference_size = (min(640, max_still_size[0]), min(480, max_still_size[1]))
 
     try:
         picam.start()
@@ -1013,15 +1041,7 @@ def main() -> int:
                         print(f"Photo capture failed: {capture_err}")
                     finally:
                         # Recreate preview camera after external capture command.
-                        picam = Picamera2()
-                        config = picam.create_video_configuration(
-                            main={"size": (cam_w, cam_h), "format": "RGB888"},
-                            controls={"FrameDurationLimits": (frame_duration_us, frame_duration_us)},
-                            buffer_count=4,
-                            queue=True,
-                        )
-                        picam.configure(config)
-                        picam.start()
+                        picam = create_preview_camera(Picamera2, cam_w, cam_h, frame_duration_us)
                         if current_wb_gains is not None:
                             picam.set_controls({"AwbEnable": False, "ColourGains": current_wb_gains})
                     continue
@@ -1030,15 +1050,35 @@ def main() -> int:
                 if touch_pos is not None:
                     try:
                         touch_x, touch_y = touch_pos
-                        wb_reference_frame = capture_wb_reference_frame(picam)
+                        presenter.present(black_payload)
+                        # Fully release preview stream/device before WB reference still capture.
+                        picam.stop()
+                        picam.close()
+                        time.sleep(0.15)
+                        with tempfile.NamedTemporaryFile(
+                            prefix="raspycam_wb_",
+                            suffix=".jpg",
+                            delete=False,
+                        ) as tmp_file:
+                            wb_reference_path = pathlib.Path(tmp_file.name)
+                        try:
+                            capture_wb_reference_photo_to_file(
+                                reference_size=wb_reference_size,
+                                output_path=wb_reference_path,
+                            )
+                            with Image.open(wb_reference_path) as reference_img:
+                                wb_reference_frame = np.asarray(reference_img.convert("RGB"), dtype=np.uint8)
+                        finally:
+                            try:
+                                wb_reference_path.unlink()
+                            except Exception:
+                                pass
                         r_gain, b_gain = estimate_white_balance_gains(wb_reference_frame)
                         if (r_gain <= 0.11 and b_gain <= 0.11) or (r_gain >= 7.9 and b_gain >= 7.9):
                             raise ValueError(
                                 "WB estimate saturated at clamp limits; ignoring unstable reference frame."
                             )
-                        picam.set_controls({"AwbEnable": False, "ColourGains": (r_gain, b_gain)})
                         current_wb_gains = (r_gain, b_gain)
-                        frame = picam.capture_array("main")
                         try:
                             save_white_balance_profile(WB_PROFILE_PATH, r_gain, b_gain)
                         except Exception as save_err:
@@ -1057,6 +1097,11 @@ def main() -> int:
                         )
                     except Exception as e:
                         print(f"Failed to reset white balance from touch: {e}")
+                    finally:
+                        picam = create_preview_camera(Picamera2, cam_w, cam_h, frame_duration_us)
+                        if current_wb_gains is not None:
+                            picam.set_controls({"AwbEnable": False, "ColourGains": current_wb_gains})
+                    continue
                 preview = prepare_preview_frame(frame, preview_w, preview_h, args.rotate)
                 if time.monotonic() < wb_message_until:
                     preview = draw_status_message(preview, "White Balance Reset")
