@@ -58,6 +58,20 @@ def read_bits_per_pixel(fb_name: str) -> Optional[int]:
     return read_int_sysfs(f"/sys/class/graphics/{fb_name}/bits_per_pixel")
 
 
+def read_channel_offset(fb_name: str, channel: str) -> Optional[int]:
+    path = f"/sys/class/graphics/{fb_name}/{channel}"
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            # Format is usually "offset,length,msb_right".
+            raw = f.read().strip()
+        parts = raw.split(",")
+        return int(parts[0])
+    except Exception:
+        return None
+
+
 def list_framebuffers() -> List[str]:
     return sorted(str(p) for p in pathlib.Path("/dev").glob("fb*"))
 
@@ -145,6 +159,13 @@ def infer_pixel_format(fb_name: str) -> str:
     bpp = read_bits_per_pixel(fb_name)
     if bpp == 32:
         return "xrgb8888"
+    if bpp == 16:
+        red_offset = read_channel_offset(fb_name, "red")
+        blue_offset = read_channel_offset(fb_name, "blue")
+        if red_offset is not None and blue_offset is not None:
+            if red_offset < blue_offset:
+                return "bgr565le"
+            return "rgb565le"
     return "rgb565le"
 
 
