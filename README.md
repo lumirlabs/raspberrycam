@@ -35,6 +35,11 @@ python3 scripts/hw_smoketest.py --skip-display
 
 # explicit framebuffer and display size
 python3 scripts/hw_smoketest.py --fb /dev/fb1 --size 480x320
+
+# if colors look wrong on LCD, try explicit pixel formats
+python3 scripts/hw_smoketest.py --pixel-format rgb565le
+python3 scripts/hw_smoketest.py --pixel-format bgr565le
+python3 scripts/hw_smoketest.py --pixel-format rgb565be
 ```
 
 Default framebuffer selection is `auto` (tries `/dev/fb1`, then `/dev/fb0`).

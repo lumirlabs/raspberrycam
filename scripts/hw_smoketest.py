@@ -38,6 +38,20 @@ def parse_virtual_size(fb_name: str) -> Optional[Tuple[int, int]]:
         return None
 
 
+def read_int_sysfs(path: str) -> Optional[int]:
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return int(f.read().strip())
+    except Exception:
+        return None
+
+
+def read_bits_per_pixel(fb_name: str) -> Optional[int]:
+    return read_int_sysfs(f"/sys/class/graphics/{fb_name}/bits_per_pixel")
+
+
 def list_framebuffers() -> List[str]:
     return sorted(str(p) for p in pathlib.Path("/dev").glob("fb*"))
 
@@ -146,22 +160,64 @@ def build_status_image(
     return canvas
 
 
-def rgb888_to_rgb565_bytes(image: Image.Image) -> bytes:
+def rgb888_to_rgb565_bytes(image: Image.Image, *, little_endian: bool, bgr: bool) -> bytes:
     image = image.convert("RGB")
     out = bytearray(image.width * image.height * 2)
     i = 0
     for r, g, b in image.getdata():
+        if bgr:
+            r, b = b, r
         rgb565 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
-        out[i] = (rgb565 >> 8) & 0xFF
-        out[i + 1] = rgb565 & 0xFF
+        if little_endian:
+            out[i] = rgb565 & 0xFF
+            out[i + 1] = (rgb565 >> 8) & 0xFF
+        else:
+            out[i] = (rgb565 >> 8) & 0xFF
+            out[i + 1] = rgb565 & 0xFF
         i += 2
     return bytes(out)
 
 
-def write_framebuffer(image: Image.Image, fb_path: str, width: int, height: int) -> None:
+def rgb888_to_xrgb8888_bytes(image: Image.Image) -> bytes:
+    image = image.convert("RGB")
+    out = bytearray(image.width * image.height * 4)
+    i = 0
+    for r, g, b in image.getdata():
+        # Little-endian XRGB8888 byte order in memory: B, G, R, X
+        out[i] = b
+        out[i + 1] = g
+        out[i + 2] = r
+        out[i + 3] = 0x00
+        i += 4
+    return bytes(out)
+
+
+def encode_framebuffer_payload(image: Image.Image, pixel_format: str) -> bytes:
+    if pixel_format == "rgb565le":
+        return rgb888_to_rgb565_bytes(image, little_endian=True, bgr=False)
+    if pixel_format == "rgb565be":
+        return rgb888_to_rgb565_bytes(image, little_endian=False, bgr=False)
+    if pixel_format == "bgr565le":
+        return rgb888_to_rgb565_bytes(image, little_endian=True, bgr=True)
+    if pixel_format == "xrgb8888":
+        return rgb888_to_xrgb8888_bytes(image)
+    raise ValueError(f"Unsupported pixel format: {pixel_format}")
+
+
+def infer_pixel_format(fb_name: str) -> str:
+    bpp = read_bits_per_pixel(fb_name)
+    if bpp == 32:
+        return "xrgb8888"
+    # Most SPI TFT drivers (including LCD-show setups) use 16bpp little-endian RGB565.
+    return "rgb565le"
+
+
+def write_framebuffer(
+    image: Image.Image, fb_path: str, width: int, height: int, pixel_format: str
+) -> None:
     if image.size != (width, height):
         image = image.resize((width, height), Image.Resampling.LANCZOS)
-    payload = rgb888_to_rgb565_bytes(image)
+    payload = encode_framebuffer_payload(image, pixel_format)
     with open(fb_path, "wb") as fb:
         fb.write(payload)
 
@@ -188,6 +244,12 @@ def main() -> int:
         action="store_true",
         help="Capture and save image, but do not write to framebuffer",
     )
+    parser.add_argument(
+        "--pixel-format",
+        choices=["auto", "rgb565le", "rgb565be", "bgr565le", "xrgb8888"],
+        default="auto",
+        help="Framebuffer pixel format (default: auto)",
+    )
     args = parser.parse_args()
 
     try:
@@ -206,6 +268,9 @@ def main() -> int:
 
     print(f"Display target: {disp_w}x{disp_h}")
     print(f"Framebuffer selected: {fb_path}")
+    fb_bpp = read_bits_per_pixel(fb_name)
+    if fb_bpp is not None:
+        print(f"Framebuffer bits_per_pixel: {fb_bpp}")
 
     camera_img, camera_status = capture_camera_image(1536, 864)
     if camera_img is not None:
@@ -236,7 +301,11 @@ def main() -> int:
         return 1
 
     try:
-        write_framebuffer(status_img, fb_path, disp_w, disp_h)
+        pixel_format = args.pixel_format
+        if pixel_format == "auto":
+            pixel_format = infer_pixel_format(fb_name)
+        print(f"Framebuffer pixel format: {pixel_format}")
+        write_framebuffer(status_img, fb_path, disp_w, disp_h, pixel_format)
         print(f"Wrote status image to framebuffer: {fb_path}")
         print("If the display remains blank, try running as root (sudo).")
         return 0
