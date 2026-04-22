@@ -203,6 +203,15 @@ def prepare_preview_frame(frame: np.ndarray, preview_w: int, preview_h: int, rot
     return img
 
 
+def bgr_frame_to_rgb(frame: np.ndarray) -> np.ndarray:
+    if frame.ndim != 3 or frame.shape[2] < 3:
+        raise ValueError(f"Unexpected camera frame shape: {frame.shape}")
+    # Picamera2 BGR888 frames arrive as B, G, R; convert to RGB for a single
+    # consistent internal color space across live preview, base image, and
+    # captured-photo preview.
+    return frame[:, :, :3][:, :, ::-1]
+
+
 def run_still_capture_command(cmd: List[str]) -> None:
     try:
         subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -379,7 +388,7 @@ def capture_still_photo_to_file(
 def create_preview_camera(Picamera2, cam_w: int, cam_h: int, frame_duration_us: int):
     picam = Picamera2()
     config = picam.create_video_configuration(
-        main={"size": (cam_w, cam_h), "format": "RGB888"},
+        main={"size": (cam_w, cam_h), "format": "BGR888"},
         controls={"FrameDurationLimits": (frame_duration_us, frame_duration_us)},
         buffer_count=4,
         queue=True,
@@ -921,7 +930,7 @@ def main() -> int:
     frame_duration_us = int(1_000_000 / target_fps)
     picam = Picamera2()
     config = picam.create_video_configuration(
-        main={"size": (cam_w, cam_h), "format": "RGB888"},
+        main={"size": (cam_w, cam_h), "format": "BGR888"},
         controls={"FrameDurationLimits": (frame_duration_us, frame_duration_us)},
         buffer_count=4,
         queue=True,
@@ -1027,8 +1036,10 @@ def main() -> int:
                         # Recreate preview camera after external capture command.
                         picam = create_preview_camera(Picamera2, cam_w, cam_h, frame_duration_us)
                         apply_wb_preset(picam, wb_presets[wb_preset_idx])
+                        # Restore the static background before region-based live updates.
+                        presenter.present(base_payload)
                     continue
-                frame = picam.capture_array("main")
+                frame = bgr_frame_to_rgb(picam.capture_array("main"))
                 touch_pos = touch_monitor.poll_touched()
                 if touch_pos is not None:
                     try:
