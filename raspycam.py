@@ -44,7 +44,7 @@ ABS_MT_POSITION_Y = 0x36
 GPIO_BUTTON_PIN = 16
 INPUT_EVENT_STRUCT = struct.Struct("llHHI")
 WB_PROFILE_PATH = pathlib.Path(__file__).with_name("white_balance_gains.json")
-PHOTO_DIR = pathlib.Path("/DCIM")
+PHOTO_DIR = pathlib.Path(__file__).resolve().parent / "DCIM"
 PHOTO_PREFIX = "lmr_"
 
 
@@ -215,6 +215,18 @@ def estimate_white_balance_gains(frame: np.ndarray) -> Tuple[float, float]:
     r_gain = min(max(r_gain, 0.1), 8.0)
     b_gain = min(max(b_gain, 0.1), 8.0)
     return r_gain, b_gain
+
+
+def capture_wb_reference_frame(picam, settle_frames: int = 2) -> np.ndarray:
+    """
+    Capture a fresh frame with neutral colour gains for WB estimation.
+    """
+    picam.set_controls({"AwbEnable": False, "ColourGains": (1.0, 1.0)})
+    # Drop a couple of frames so the control change is reflected in the sensor output.
+    frame = picam.capture_array("main")
+    for _ in range(max(settle_frames, 0)):
+        frame = picam.capture_array("main")
+    return frame
 
 
 def draw_status_message(frame: np.ndarray, text: str) -> np.ndarray:
@@ -542,6 +554,8 @@ class TouchInputMonitor:
     paths: List[str]
     last_touch_ts: float = 0.0
     debounce_s: float = 0.2
+    last_touch_x: Optional[int] = None
+    last_touch_y: Optional[int] = None
 
     @classmethod
     def create(cls) -> "TouchInputMonitor":
@@ -554,15 +568,15 @@ class TouchInputMonitor:
                 continue
         return cls(fds=fds, paths=paths)
 
-    def poll_touched(self) -> bool:
+    def poll_touched(self) -> Optional[Tuple[Optional[int], Optional[int]]]:
         if not self.fds:
-            return False
+            return None
         touched = False
         now = time.monotonic()
         try:
             ready, _, _ = select.select(self.fds, [], [], 0.0)
         except Exception:
-            return False
+            return None
         for fd in ready:
             while True:
                 try:
@@ -576,16 +590,24 @@ class TouchInputMonitor:
                 _, _, event_type, event_code, event_value = INPUT_EVENT_STRUCT.unpack(chunk)
                 if event_type == EV_KEY and event_code == BTN_TOUCH and event_value == 1:
                     touched = True
+                elif event_type == EV_ABS and event_code == ABS_MT_POSITION_X:
+                    self.last_touch_x = int(event_value)
+                    if event_value > 0:
+                        touched = True
+                elif event_type == EV_ABS and event_code == ABS_MT_POSITION_Y:
+                    self.last_touch_y = int(event_value)
+                    if event_value > 0:
+                        touched = True
                 elif (
                     event_type == EV_ABS
-                    and event_code in (ABS_PRESSURE, ABS_MT_POSITION_X, ABS_MT_POSITION_Y)
+                    and event_code == ABS_PRESSURE
                     and event_value > 0
                 ):
                     touched = True
         if touched and (now - self.last_touch_ts) >= self.debounce_s:
             self.last_touch_ts = now
-            return True
-        return False
+            return self.last_touch_x, self.last_touch_y
+        return None
 
     def close(self) -> None:
         for fd in self.fds:
@@ -980,18 +1002,28 @@ def main() -> int:
                             picam.set_controls({"AwbEnable": False, "ColourGains": current_wb_gains})
                     continue
                 frame = picam.capture_array("main")
-                if touch_monitor.poll_touched():
-                    r_gain, b_gain = estimate_white_balance_gains(frame)
+                touch_pos = touch_monitor.poll_touched()
+                if touch_pos is not None:
                     try:
+                        touch_x, touch_y = touch_pos
+                        wb_reference_frame = capture_wb_reference_frame(picam)
+                        r_gain, b_gain = estimate_white_balance_gains(wb_reference_frame)
                         picam.set_controls({"AwbEnable": False, "ColourGains": (r_gain, b_gain)})
                         current_wb_gains = (r_gain, b_gain)
+                        frame = picam.capture_array("main")
                         try:
                             save_white_balance_profile(WB_PROFILE_PATH, r_gain, b_gain)
                         except Exception as save_err:
                             print(f"Failed to save white balance profile: {save_err}")
                         wb_message_until = time.monotonic() + 1.0
+                        touch_coords = (
+                            f"touch=({touch_x}, {touch_y})"
+                            if touch_x is not None and touch_y is not None
+                            else "touch=(unknown)"
+                        )
                         print(
                             "White balance reset from touch: "
+                            f"{touch_coords} "
                             f"ColourGains=({r_gain:.3f}, {b_gain:.3f}) "
                             f"(saved to {WB_PROFILE_PATH.name})"
                         )
