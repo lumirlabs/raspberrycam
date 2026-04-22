@@ -376,7 +376,7 @@ def capture_wb_reference_photo_to_file(reference_size: Tuple[int, int], output_p
         "-n",
         "--immediate",
         "--awb",
-        "off",
+        "custom",
         "--width",
         str(reference_size[0]),
         "--height",
@@ -386,7 +386,29 @@ def capture_wb_reference_photo_to_file(reference_size: Tuple[int, int], output_p
         "-o",
         str(output_path),
     ]
-    run_still_capture_command(cmd)
+    try:
+        run_still_capture_command(cmd)
+    except RuntimeError as exc:
+        # Some stacks reject `--awb custom`; neutral manual gains still disable AWB.
+        fallback_cmd = [
+            still_cli,
+            "-n",
+            "--immediate",
+            "--awbgains",
+            "1.0,1.0",
+            "--width",
+            str(reference_size[0]),
+            "--height",
+            str(reference_size[1]),
+            "--timeout",
+            "200",
+            "-o",
+            str(output_path),
+        ]
+        try:
+            run_still_capture_command(fallback_cmd)
+        except RuntimeError:
+            raise exc
 
 
 def create_preview_camera(Picamera2, cam_w: int, cam_h: int, frame_duration_us: int):
