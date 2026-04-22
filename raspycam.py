@@ -23,7 +23,6 @@ import shutil
 import struct
 import subprocess
 import sys
-import tempfile
 import time
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
@@ -371,49 +370,35 @@ def capture_still_photo_to_file(
     run_still_capture_command(cmd)
 
 
-def capture_wb_reference_photo_to_file(reference_size: Tuple[int, int], output_path: pathlib.Path) -> None:
-    still_cli = shutil.which("rpicam-still") or shutil.which("libcamera-still")
-    if still_cli is None:
-        raise RuntimeError("Neither rpicam-still nor libcamera-still is installed.")
-
-    cmd = [
-        still_cli,
-        "-n",
-        "--immediate",
-        "--awb",
-        "custom",
-        "--width",
-        str(reference_size[0]),
-        "--height",
-        str(reference_size[1]),
-        "--timeout",
-        "200",
-        "-o",
-        str(output_path),
-    ]
+def capture_wb_reference_frame(
+    Picamera2,
+    reference_size: Tuple[int, int],
+    settle_frames: int = 12,
+) -> np.ndarray:
+    wb_cam = Picamera2()
     try:
-        run_still_capture_command(cmd)
-    except RuntimeError as exc:
-        # Some stacks reject `--awb custom`; neutral manual gains still disable AWB.
-        fallback_cmd = [
-            still_cli,
-            "-n",
-            "--immediate",
-            "--awbgains",
-            "1.0,1.0",
-            "--width",
-            str(reference_size[0]),
-            "--height",
-            str(reference_size[1]),
-            "--timeout",
-            "200",
-            "-o",
-            str(output_path),
-        ]
+        config = wb_cam.create_video_configuration(
+            main={"size": reference_size, "format": "RGB888"},
+            buffer_count=4,
+            queue=True,
+        )
+        wb_cam.configure(config)
+        wb_cam.start()
+        wb_cam.set_controls({"AwbEnable": False, "ColourGains": (1.0, 1.0)})
+        time.sleep(0.10)
+        frame = wb_cam.capture_array("main")
+        for _ in range(max(settle_frames, 0)):
+            frame = wb_cam.capture_array("main")
+        return frame
+    finally:
         try:
-            run_still_capture_command(fallback_cmd)
-        except RuntimeError:
-            raise exc
+            wb_cam.stop()
+        except Exception:
+            pass
+        try:
+            wb_cam.close()
+        except Exception:
+            pass
 
 
 def create_preview_camera(Picamera2, cam_w: int, cam_h: int, frame_duration_us: int):
@@ -1082,24 +1067,10 @@ def main() -> int:
                         picam.stop()
                         picam.close()
                         time.sleep(0.15)
-                        with tempfile.NamedTemporaryFile(
-                            prefix="raspycam_wb_",
-                            suffix=".jpg",
-                            delete=False,
-                        ) as tmp_file:
-                            wb_reference_path = pathlib.Path(tmp_file.name)
-                        try:
-                            capture_wb_reference_photo_to_file(
-                                reference_size=wb_reference_size,
-                                output_path=wb_reference_path,
-                            )
-                            with Image.open(wb_reference_path) as reference_img:
-                                wb_reference_frame = np.asarray(reference_img.convert("RGB"), dtype=np.uint8)
-                        finally:
-                            try:
-                                wb_reference_path.unlink()
-                            except Exception:
-                                pass
+                        wb_reference_frame = capture_wb_reference_frame(
+                            Picamera2=Picamera2,
+                            reference_size=wb_reference_size,
+                        )
                         r_gain, b_gain, r_mean, g_mean, b_mean = estimate_white_balance_stats(
                             wb_reference_frame
                         )
