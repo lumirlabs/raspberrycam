@@ -1037,7 +1037,7 @@ def main() -> int:
                         # Restore the static background before region-based live updates.
                         presenter.present(base_payload)
                     continue
-                frame = picam.capture_array("main")
+                frame = swap_red_blue_channels(picam.capture_array("main"))
                 touch_pos = touch_monitor.poll_touched()
                 if touch_pos is not None:
                     try:
