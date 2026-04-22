@@ -19,7 +19,9 @@ import os
 import pathlib
 import re
 import select
+import shutil
 import struct
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -310,27 +312,39 @@ def capture_still_photo_to_file(
         or int(max_size[1]) <= 0
     ):
         max_size = fallback_size
-    still_controls = {}
-    if current_wb_gains is not None:
-        still_controls["AwbEnable"] = False
-        still_controls["ColourGains"] = current_wb_gains
-    still_config = picam.create_still_configuration(
-        main={"size": max_size},
-        raw=None,
-        buffer_count=1,
-        queue=False,
-        controls=still_controls,
-    )
-
+    still_cli = shutil.which("rpicam-still") or shutil.which("libcamera-still")
     picam.stop()
     try:
-        picam.configure(still_config)
-        picam.start()
-        # Focus in still mode right before capture.
-        trigger_autofocus(picam)
-        picam.capture_file(str(output_path), name="main")
+        if still_cli is None:
+            raise RuntimeError("Neither rpicam-still nor libcamera-still is installed.")
+
+        cmd = [
+            still_cli,
+            "-n",
+            "--width",
+            str(max_size[0]),
+            "--height",
+            str(max_size[1]),
+            "--autofocus-mode",
+            "auto",
+            "--autofocus-on-capture",
+            "--timeout",
+            "1200",
+            "-o",
+            str(output_path),
+        ]
+        if current_wb_gains is not None:
+            r_gain, b_gain = current_wb_gains
+            cmd.extend(["--awbgains", f"{r_gain:.6f},{b_gain:.6f}"])
+
+        try:
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        except subprocess.CalledProcessError as exc:
+            output = (exc.stdout or "").strip()
+            if output:
+                raise RuntimeError(output.splitlines()[-1]) from exc
+            raise RuntimeError(str(exc)) from exc
     finally:
-        picam.stop()
         picam.configure(preview_config)
         picam.start()
         if current_wb_gains is not None:
