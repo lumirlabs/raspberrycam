@@ -16,9 +16,11 @@ import fcntl
 import mmap
 import os
 import pathlib
+import select
 import struct
 import sys
 import time
+from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -29,6 +31,14 @@ FBIOPAN_DISPLAY = 0x4606
 FBIO_WAITFORVSYNC = 0x4680
 FB_VAR_SCREENINFO_SIZE = 160
 FB_YOFFSET_OFFSET = 20
+EV_KEY = 0x01
+EV_ABS = 0x03
+BTN_TOUCH = 0x014A
+ABS_PRESSURE = 0x18
+ABS_MT_POSITION_X = 0x35
+ABS_MT_POSITION_Y = 0x36
+GPIO_BUTTON_PIN = 16
+INPUT_EVENT_STRUCT = struct.Struct("llHHI")
 
 
 def parse_virtual_size(fb_name: str) -> Optional[Tuple[int, int]]:
@@ -347,6 +357,162 @@ class FramebufferPresenter:
         return self.pageflip_enabled or self.vsync_enabled
 
 
+def discover_touch_devices() -> List[str]:
+    devices: List[str] = []
+    input_class = pathlib.Path("/sys/class/input")
+    if not input_class.exists():
+        return devices
+
+    keywords = ("touch", "xpt2046", "ads7846", "goodix", "ft5", "stmpe")
+    for event_node in sorted(input_class.glob("event*")):
+        dev_name_path = event_node / "device" / "name"
+        dev_name = ""
+        try:
+            dev_name = dev_name_path.read_text(encoding="utf-8").strip().lower()
+        except Exception:
+            continue
+        if any(k in dev_name for k in keywords):
+            dev_path = f"/dev/input/{event_node.name}"
+            if os.path.exists(dev_path):
+                devices.append(dev_path)
+    return devices
+
+
+@dataclass
+class TouchInputMonitor:
+    fds: List[int]
+    paths: List[str]
+    last_touch_ts: float = 0.0
+    debounce_s: float = 0.2
+
+    @classmethod
+    def create(cls) -> "TouchInputMonitor":
+        paths = discover_touch_devices()
+        fds: List[int] = []
+        for path in paths:
+            try:
+                fds.append(os.open(path, os.O_RDONLY | os.O_NONBLOCK))
+            except OSError:
+                continue
+        return cls(fds=fds, paths=paths)
+
+    def poll_touched(self) -> bool:
+        if not self.fds:
+            return False
+        touched = False
+        now = time.monotonic()
+        try:
+            ready, _, _ = select.select(self.fds, [], [], 0.0)
+        except Exception:
+            return False
+        for fd in ready:
+            while True:
+                try:
+                    chunk = os.read(fd, INPUT_EVENT_STRUCT.size)
+                except BlockingIOError:
+                    break
+                except OSError:
+                    break
+                if len(chunk) < INPUT_EVENT_STRUCT.size:
+                    break
+                _, _, event_type, event_code, event_value = INPUT_EVENT_STRUCT.unpack(chunk)
+                if event_type == EV_KEY and event_code == BTN_TOUCH and event_value == 1:
+                    touched = True
+                elif (
+                    event_type == EV_ABS
+                    and event_code in (ABS_PRESSURE, ABS_MT_POSITION_X, ABS_MT_POSITION_Y)
+                    and event_value > 0
+                ):
+                    touched = True
+        if touched and (now - self.last_touch_ts) >= self.debounce_s:
+            self.last_touch_ts = now
+            return True
+        return False
+
+    def close(self) -> None:
+        for fd in self.fds:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        self.fds.clear()
+
+
+@dataclass
+class GpioButtonMonitor:
+    pin: int
+    value_fd: Optional[int]
+    previous_value: Optional[int]
+    exported_here: bool
+
+    @classmethod
+    def create(cls, pin: int) -> "GpioButtonMonitor":
+        gpio_path = pathlib.Path(f"/sys/class/gpio/gpio{pin}")
+        exported_here = False
+        if not gpio_path.exists():
+            try:
+                pathlib.Path("/sys/class/gpio/export").write_text(f"{pin}", encoding="utf-8")
+                exported_here = True
+            except Exception:
+                return cls(pin=pin, value_fd=None, previous_value=None, exported_here=False)
+
+        try:
+            (gpio_path / "direction").write_text("in", encoding="utf-8")
+        except Exception:
+            pass
+        try:
+            # Falling edge matches a typical active-low tactile button wiring.
+            (gpio_path / "edge").write_text("falling", encoding="utf-8")
+        except Exception:
+            pass
+
+        value_fd: Optional[int] = None
+        previous_value: Optional[int] = None
+        try:
+            value_fd = os.open(str(gpio_path / "value"), os.O_RDONLY | os.O_NONBLOCK)
+            os.lseek(value_fd, 0, os.SEEK_SET)
+            initial = os.read(value_fd, 1)
+            if initial:
+                previous_value = int(initial)
+        except Exception:
+            if value_fd is not None:
+                try:
+                    os.close(value_fd)
+                except OSError:
+                    pass
+            value_fd = None
+        return cls(pin=pin, value_fd=value_fd, previous_value=previous_value, exported_here=exported_here)
+
+    def poll_pressed(self) -> bool:
+        if self.value_fd is None:
+            return False
+        try:
+            os.lseek(self.value_fd, 0, os.SEEK_SET)
+            raw = os.read(self.value_fd, 1)
+            if not raw:
+                return False
+            value = int(raw)
+        except Exception:
+            return False
+
+        pressed = self.previous_value == 1 and value == 0
+        self.previous_value = value
+        return pressed
+
+    def close(self) -> None:
+        if self.value_fd is not None:
+            try:
+                os.close(self.value_fd)
+            except OSError:
+                pass
+            self.value_fd = None
+        if self.exported_here:
+            try:
+                pathlib.Path("/sys/class/gpio/unexport").write_text(f"{self.pin}", encoding="utf-8")
+            except Exception:
+                pass
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Raspberry Pi digicam live preview")
     parser.add_argument(
@@ -486,6 +652,8 @@ def main() -> int:
     started = time.monotonic()
     last_stats = started
     presenter: Optional[FramebufferPresenter] = None
+    touch_monitor = TouchInputMonitor.create()
+    button_monitor = GpioButtonMonitor.create(GPIO_BUTTON_PIN)
 
     try:
         with open(fb_path, "r+b", buffering=0) as fb:
@@ -508,10 +676,22 @@ def main() -> int:
                     print(f"Unsynced fallback: capping update rate to {effective_fps:.1f} fps")
                 else:
                     print("Unsynced fallback: fps cap disabled")
+            if touch_monitor.fds:
+                print(f"Touch input debug enabled on: {', '.join(touch_monitor.paths)}")
+            else:
+                print("Touch input debug not enabled (no touchscreen event device found or no permission).")
+            if button_monitor.value_fd is not None:
+                print(f"GPIO button debug enabled on GPIO{GPIO_BUTTON_PIN}.")
+            else:
+                print(f"GPIO button debug not enabled on GPIO{GPIO_BUTTON_PIN} (check sysfs permissions/wiring).")
             base_payload = encode_framebuffer_payload(base_image, pixel_format)
             presenter.present(base_payload)
             while True:
                 frame_begin = time.monotonic()
+                if touch_monitor.poll_touched():
+                    print("DEBUG input: LCD touch detected")
+                if button_monitor.poll_pressed():
+                    print(f"DEBUG input: GPIO{GPIO_BUTTON_PIN} button press detected")
                 frame = picam.capture_array("main")
                 preview = prepare_preview_frame(frame, preview_w, preview_h, args.rotate)
                 payload = encode_framebuffer_payload(preview, pixel_format)
@@ -544,6 +724,8 @@ def main() -> int:
             presenter.close()
         except Exception:
             pass
+        touch_monitor.close()
+        button_monitor.close()
         picam.stop()
         picam.close()
 
