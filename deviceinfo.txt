@@ -1,0 +1,72 @@
+PS C:\Users\joaop> ssh joaoperfig@epaperclock.local
+joaoperfig@epaperclock.local's password:
+Linux epaperclock 6.12.47+rpt-rpi-v8 #1 SMP PREEMPT Debian 1:6.12.47-1+rpt1 (2025-09-16) aarch64
+
+The programs included with the Debian GNU/Linux system are free software;
+the exact distribution terms for each program are described in the
+individual files in /usr/share/doc/*/copyright.
+
+Debian GNU/Linux comes with ABSOLUTELY NO WARRANTY, to the extent
+permitted by applicable law.
+Last login: Tue Apr 21 17:52:29 2026 from fe80::fda3:ec6a:df6a:f514%wlan0
+joaoperfig@epaperclock:~ $ cat /etc/os-release
+PRETTY_NAME="Debian GNU/Linux 13 (trixie)"
+NAME="Debian GNU/Linux"
+VERSION_ID="13"
+VERSION="13 (trixie)"
+VERSION_CODENAME=trixie
+DEBIAN_VERSION_FULL=13.2
+ID=debian
+HOME_URL="https://www.debian.org/"
+SUPPORT_URL="https://www.debian.org/support"
+BUG_REPORT_URL="https://bugs.debian.org/"
+joaoperfig@epaperclock:~ $ uname -a
+Linux epaperclock 6.12.47+rpt-rpi-v8 #1 SMP PREEMPT Debian 1:6.12.47-1+rpt1 (2025-09-16) aarch64 GNU/Linux
+joaoperfig@epaperclock:~ $ cat /proc/cpuinfo
+processor       : 0
+BogoMIPS        : 38.40
+Features        : fp asimd evtstrm crc32 cpuid
+CPU implementer : 0x41
+CPU architecture: 8
+CPU variant     : 0x0
+CPU part        : 0xd03
+CPU revision    : 4
+
+processor       : 1
+BogoMIPS        : 38.40
+Features        : fp asimd evtstrm crc32 cpuid
+CPU implementer : 0x41
+CPU architecture: 8
+CPU variant     : 0x0
+CPU part        : 0xd03
+CPU revision    : 4
+
+processor       : 2
+BogoMIPS        : 38.40
+Features        : fp asimd evtstrm crc32 cpuid
+CPU implementer : 0x41
+CPU architecture: 8
+CPU variant     : 0x0
+CPU part        : 0xd03
+CPU revision    : 4
+
+processor       : 3
+BogoMIPS        : 38.40
+Features        : fp asimd evtstrm crc32 cpuid
+CPU implementer : 0x41
+CPU architecture: 8
+CPU variant     : 0x0
+CPU part        : 0xd03
+CPU revision    : 4
+
+Revision        : 902120
+Serial          : 000000000ba8bfee
+Model           : Raspberry Pi Zero 2 W Rev 1.0
+joaoperfig@epaperclock:~ $ hostnamectl
+ Static hostname: epaperclock
+       Icon name: computer
+      Machine ID: 25a43955fda94b228e5e784e5a632161
+         Boot ID: 0f2d30be549a46ebb07385942069021b
+Operating System: Debian GNU/Linux 13 (trixie)
+          Kernel: Linux 6.12.47+rpt-rpi-v8
+    Architecture: arm64
