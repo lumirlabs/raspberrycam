@@ -343,7 +343,7 @@ def main() -> int:
     parser.add_argument(
         "--fps",
         type=float,
-        default=30.0,
+        default=90.0,
         help="Target preview framerate (default: 30)",
     )
     parser.add_argument(
@@ -371,7 +371,7 @@ def main() -> int:
     parser.add_argument(
         "--unsynced-fps",
         type=float,
-        default=12.0,
+        default=60.0,
         help=(
             "When no framebuffer sync is available, cap preview updates to this FPS "
             "to reduce visible tearing. Set <=0 to disable (default: 12)"
