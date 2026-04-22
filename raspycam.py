@@ -49,6 +49,11 @@ PHOTO_DIR = pathlib.Path(__file__).resolve().parent / "DCIM"
 PHOTO_PREFIX = "lmr_"
 # Picamera2 "RGB888" arrays can still arrive in BGR byte order on some stacks.
 WB_REFERENCE_FRAME_IS_BGR = True
+# WB stabilizers to avoid extreme color casts from noisy reference frames.
+WB_GAIN_BLEND = 0.55
+WB_MIN_CHANNEL_MEAN = 32.0
+WB_MIN_GAIN = 0.3
+WB_MAX_GAIN = 3.0
 
 
 def parse_virtual_size(fb_name: str) -> Optional[Tuple[int, int]]:
@@ -224,19 +229,34 @@ def estimate_white_balance_stats(frame: np.ndarray) -> Tuple[float, float, float
     else:
         valid = sample[valid_mask]
     if WB_REFERENCE_FRAME_IS_BGR:
-        b_mean = float(valid[:, 0].mean())
-        g_mean = float(valid[:, 1].mean())
-        r_mean = float(valid[:, 2].mean())
+        r_values = valid[:, 2]
+        g_values = valid[:, 1]
+        b_values = valid[:, 0]
     else:
-        r_mean = float(valid[:, 0].mean())
-        g_mean = float(valid[:, 1].mean())
-        b_mean = float(valid[:, 2].mean())
+        r_values = valid[:, 0]
+        g_values = valid[:, 1]
+        b_values = valid[:, 2]
+
+    def robust_mean(channel_values: np.ndarray) -> float:
+        # Trim outliers so specular highlights/shadows do not dominate WB.
+        lo = float(np.percentile(channel_values, 5.0))
+        hi = float(np.percentile(channel_values, 95.0))
+        trimmed = channel_values[(channel_values >= lo) & (channel_values <= hi)]
+        if trimmed.size == 0:
+            return float(channel_values.mean())
+        return float(trimmed.mean())
+
+    r_mean = robust_mean(r_values)
+    g_mean = robust_mean(g_values)
+    b_mean = robust_mean(b_values)
     eps = 1e-6
-    r_gain = g_mean / max(r_mean, eps)
-    b_gain = g_mean / max(b_mean, eps)
+    r_gain_raw = g_mean / max(r_mean, WB_MIN_CHANNEL_MEAN, eps)
+    b_gain_raw = g_mean / max(b_mean, WB_MIN_CHANNEL_MEAN, eps)
+    r_gain = 1.0 + ((r_gain_raw - 1.0) * WB_GAIN_BLEND)
+    b_gain = 1.0 + ((b_gain_raw - 1.0) * WB_GAIN_BLEND)
     # Picamera2 docs indicate ColourGains values in [0, 32].
-    r_gain = min(max(r_gain, 0.1), 8.0)
-    b_gain = min(max(b_gain, 0.1), 8.0)
+    r_gain = min(max(r_gain, WB_MIN_GAIN), WB_MAX_GAIN)
+    b_gain = min(max(b_gain, WB_MIN_GAIN), WB_MAX_GAIN)
     return r_gain, b_gain, r_mean, g_mean, b_mean
 
 
