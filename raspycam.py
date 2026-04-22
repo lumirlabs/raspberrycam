@@ -203,12 +203,9 @@ def prepare_preview_frame(frame: np.ndarray, preview_w: int, preview_h: int, rot
     return img
 
 
-def bgr_frame_to_rgb(frame: np.ndarray) -> np.ndarray:
+def swap_red_blue_channels(frame: np.ndarray) -> np.ndarray:
     if frame.ndim != 3 or frame.shape[2] < 3:
-        raise ValueError(f"Unexpected camera frame shape: {frame.shape}")
-    # Picamera2 BGR888 frames arrive as B, G, R; convert to RGB for a single
-    # consistent internal color space across live preview, base image, and
-    # captured-photo preview.
+        raise ValueError(f"Unexpected frame shape for channel swap: {frame.shape}")
     return frame[:, :, :3][:, :, ::-1]
 
 
@@ -402,7 +399,7 @@ def load_photo_preview(photo_path: pathlib.Path, disp_w: int, disp_h: int) -> np
     with Image.open(photo_path) as captured:
         rgb = captured.convert("RGB")
         resized = rgb.resize((disp_w, disp_h), Image.Resampling.BILINEAR)
-    return np.asarray(resized, dtype=np.uint8)
+    return swap_red_blue_channels(np.asarray(resized, dtype=np.uint8))
 
 
 def read_u32(buf: bytearray, offset: int) -> int:
@@ -902,6 +899,7 @@ def main() -> int:
 
     try:
         base_image = load_base_image(args.base_image, disp_w, disp_h)
+        base_image = swap_red_blue_channels(base_image)
     except ValueError as e:
         print(str(e))
         return 1
@@ -1039,7 +1037,7 @@ def main() -> int:
                         # Restore the static background before region-based live updates.
                         presenter.present(base_payload)
                     continue
-                frame = bgr_frame_to_rgb(picam.capture_array("main"))
+                frame = picam.capture_array("main")
                 touch_pos = touch_monitor.poll_touched()
                 if touch_pos is not None:
                     try:
